@@ -7,13 +7,13 @@
 //  deriva da constante TEST_MODE (config.h): nenhum modulo decide ambiente por
 //  conta propria, apenas consome os ACTIVE_* definidos aqui.
 //
-//  Os valores brutos ficam em include/secrets_test.h e include/secrets_prod.h,
-//  que NAO sao versionados (modelos: *.example).
+//  Os valores brutos ficam em include/secrets.h (unico arquivo de credenciais,
+//  no mesmo padrao do Monitora_DG), que NAO e versionado (modelo:
+//  include/secrets.h.example).
 // ============================================================================
 
 #include "config.h"
-#include "secrets_prod.h"
-#include "secrets_test.h"
+#include "secrets.h"
 
 // Escolha unica e explicita entre o valor de producao e o de teste. Fica como
 // funcao constexpr (e nao if constexpr) porque o resultado inicializa
@@ -24,20 +24,20 @@ constexpr T selectValue(bool testMode, T production, T test) {
 }
 
 constexpr const char *ACTIVE_WIFI_SSID =
-    selectValue(TEST_MODE, PROD_WIFI_SSID, TEST_WIFI_SSID);
+    selectValue(TEST_MODE, WIFI_SSID_PROD, WIFI_SSID_TEST);
 constexpr const char *ACTIVE_WIFI_PASSWORD =
-    selectValue(TEST_MODE, PROD_WIFI_PASSWORD, TEST_WIFI_PASSWORD);
-constexpr const char *ACTIVE_MQTT_HOST =
-    selectValue(TEST_MODE, PROD_MQTT_HOST, TEST_MQTT_HOST);
-constexpr uint16_t ACTIVE_MQTT_PORT =
-    selectValue<uint16_t>(TEST_MODE, PROD_MQTT_PORT, TEST_MQTT_PORT);
+    selectValue(TEST_MODE, WIFI_PASSWORD_PROD, WIFI_PASSWORD_TEST);
 constexpr const char *ACTIVE_TB_TOKEN =
-    selectValue(TEST_MODE, PROD_TB_TOKEN, TEST_TB_TOKEN);
+    selectValue(TEST_MODE, TB_ACCESS_TOKEN_PROD, TB_ACCESS_TOKEN_TEST);
+
+// Host e porta do broker sao unicos para os dois ambientes (MQTT sobre TLS).
+// Nao existe porta 1883 no MoniRes: texto puro nao e usado.
+static_assert(TB_PORT == 8883, "TB_PORT deve ser 8883 (MQTT sobre TLS)");
 
 // ---------------------------------------------------------------------------
 //  Credenciais pendentes
 //
-//  Os arquivos de segredo sao entregues com placeholders "COLOQUE_..." para que
+//  O arquivo de segredos e entregue com placeholders "COLOQUE_..." para que
 //  o projeto compile antes de o usuario informar os valores reais. Enquanto
 //  isso, a comunicacao nao tenta conectar e o Serial avisa - em vez de ficar
 //  tentando indefinidamente com um valor invalido.
@@ -63,7 +63,8 @@ constexpr bool tbTokenPending() {
   return ACTIVE_TB_TOKEN[0] == '\0' || hasPlaceholderPrefix(ACTIVE_TB_TOKEN);
 }
 
-// Nome do arquivo de segredos do ambiente ativo, para as mensagens de Serial.
+// Nome do arquivo de segredos, para as mensagens de Serial. Existe apenas um
+// arquivo para os dois ambientes.
 constexpr const char *activeSecretsFileName() {
-  return TEST_MODE ? "include/secrets_test.h" : "include/secrets_prod.h";
+  return "include/secrets.h";
 }

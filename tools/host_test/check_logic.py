@@ -78,6 +78,70 @@ def decide_publish(inp):
     return 'NONE'
 
 
+class PublishGate:
+    """Copia da resolucao de ThingsBoard::update()/enqueue().
+
+    Reproduz a separacao entre decisao (sempre, com ou sem transporte) e
+    transporte (condicional): sem sessao MQTT ou com backlog pendente a amostra
+    vira registro na fila, e o baseline da politica so avanca depois de a
+    gravacao ser confirmada.
+    """
+
+    def __init__(self, delta=50.0, heartbeat_ms=3600000, min_interval_ms=10000):
+        self.delta = F32(delta)
+        self.heartbeat_ms = heartbeat_ms
+        self.min_interval_ms = min_interval_ms
+        self.has_published = False
+        self.publish_after_reconnect = False
+        self.last_published = F32(0.0)
+        self.last_publish_ms = 0
+        self.pending = 0        # registros pendentes na fila offline
+        self.append_ok = True   # LittleFS disponivel / gravacao confirmada
+        self.published = 0
+        self.enqueued = 0
+        self.last_reason = 'NONE'
+
+    def connection_lost(self):
+        self.publish_after_reconnect = True
+
+    def _register(self, now_ms, volume):
+        self.has_published = True
+        self.last_published = F32(volume)
+        self.last_publish_ms = now_ms
+
+    def _enqueue(self, now_ms, volume):
+        if not self.append_ok:
+            return False
+        self._register(now_ms, volume)
+        self.publish_after_reconnect = False
+        self.pending += 1
+        self.enqueued += 1
+        return True
+
+    def step(self, now_ms, volume, online):
+        self.last_reason = decide_publish({
+            'sampleValid': True,
+            'hasPublished': self.has_published,
+            'publishAfterReconnect': self.publish_after_reconnect,
+            'volumeL': F32(volume),
+            'lastPublishedL': self.last_published,
+            'nowMs': now_ms,
+            'lastPublishMs': self.last_publish_ms,
+            'deltaLiters': self.delta,
+            'heartbeatMs': self.heartbeat_ms,
+            'minIntervalMs': self.min_interval_ms,
+        })
+        if self.last_reason == 'NONE':
+            return self.last_reason
+        if online and self.pending == 0:
+            self._register(now_ms, volume)
+            self.publish_after_reconnect = False
+            self.published += 1
+            return self.last_reason
+        self._enqueue(now_ms, volume)
+        return self.last_reason
+
+
 def main():
     failures = 0
 
@@ -183,6 +247,73 @@ def main():
     policy_case('HEARTBEAT', '60 min sem mudanca', nowMs=1000 + 3600000, volumeL=1000.0)
     policy_case('RECONNECT', 'reconexao publica imediatamente', nowMs=2000,
                 publishAfterReconnect=True)
+
+    print('\n== offline: decisao independente do transporte ==')
+    gate = PublishGate()
+    gate.step(1000, 1000.0, True)
+    check(gate.published == 1 and gate.pending == 0,
+          'online: FIRST publica e a fila fica vazia')
+
+    gate.connection_lost()
+    check(gate.step(2000, 1000.0, False) == 'RECONNECT',
+          'offline: politica decide RECONNECT')
+    check(gate.pending == 1, 'offline: RECONNECT vira 1 registro')
+    check(not gate.publish_after_reconnect,
+          'offline: RECONNECT nao permanece como estado continuo')
+
+    for step in range(39):
+        gate.step(2250 + 250 * step, 1005.0 if step % 2 else 1000.0, False)
+    check(gate.pending == 1,
+          'offline ~10 s sem variacao: nenhum registro por ciclo de 250 ms')
+
+    gate.step(12000, 1080.0, False)
+    check(gate.last_reason == 'DELTA' and gate.pending == 2,
+          'offline: DELTA apos o intervalo minimo enfileira')
+    gate.step(12250, 1140.0, False)
+    check(gate.pending == 2, 'offline: DELTA antes do intervalo minimo espera')
+    gate.step(22000, 1140.0, False)
+    check(gate.pending == 3, 'offline: DELTA apos o intervalo enfileira de novo')
+
+    hb = PublishGate()
+    hb.step(1000, 500.0, True)
+    hb.connection_lost()
+    hb.step(2000, 500.0, False)
+    check(hb.pending == 1, 'heartbeat: registro de reconexao enfileirado')
+    hb.step(2000 + 3600000, 500.0, False)
+    check(hb.last_reason == 'HEARTBEAT' and hb.pending == 2,
+          'offline: heartbeat enfileira mesmo sem variacao')
+
+    bad = PublishGate()
+    bad.step(1000, 500.0, True)
+    bad.connection_lost()
+    bad.append_ok = False
+    bad.step(2000, 500.0, False)
+    check(bad.pending == 0, 'falha de gravacao: nenhum registro criado')
+    check(bad.publish_after_reconnect,
+          'falha de gravacao: RECONNECT continua pendente')
+    check(bad.last_publish_ms == 1000,
+          'falha de gravacao: baseline da politica nao avanca')
+    bad.append_ok = True
+    bad.step(2250, 500.0, False)
+    check(bad.pending == 1 and not bad.publish_after_reconnect,
+          'retentativa: grava uma unica vez e libera o RECONNECT')
+
+    backlog = PublishGate()
+    backlog.step(1000, 500.0, True)
+    backlog.connection_lost()
+    backlog.step(2000, 500.0, False)
+    backlog.step(22000, 620.0, False)
+    backlog.step(33000, 700.0, True)
+    check(backlog.pending == 3 and backlog.published == 1,
+          'reconexao com backlog: leitura nova entra na fila (ordem preservada)')
+    backlog.pending = 0
+    backlog.step(45000, 780.0, True)
+    check(backlog.published == 2, 'fila vazia: volta a publicar direto')
+
+    boot = PublishGate()
+    boot.step(1000, 400.0, False)
+    check(boot.pending == 1 and boot.published == 0,
+          'primeira leitura sem conexao: vai para a fila (FIRST)')
 
     print('\n%s (%d falha(s))'
           % ('TODOS OS TESTES PASSARAM' if failures == 0 else 'HOUVE FALHAS', failures))

@@ -72,6 +72,62 @@ void preview(long value, uint8_t dots, char *out) {
   out[n] = '\0';
 }
 
+// Espelho da resolucao de ThingsBoard::update()/enqueue(): a decisao nunca
+// depende do transporte e o baseline da politica so avanca depois de a
+// gravacao ser confirmada na fila.
+struct Gate {
+  bool hasPublished = false;
+  bool publishAfterReconnect = false;
+  bool appendOk = true;
+  float lastPublishedL = 0.0f;
+  uint32_t lastPublishMs = 0;
+  uint32_t pending = 0;
+  uint32_t published = 0;
+
+  void registerPublished(uint32_t nowMs, float volumeL) {
+    hasPublished = true;
+    lastPublishedL = volumeL;
+    lastPublishMs = nowMs;
+  }
+
+  bool enqueue(uint32_t nowMs, float volumeL) {
+    if (!appendOk) {
+      return false;  // gravacao nao confirmada: nada avanca
+    }
+    registerPublished(nowMs, volumeL);
+    publishAfterReconnect = false;
+    ++pending;
+    return true;
+  }
+
+  publish_policy::Reason step(uint32_t nowMs, float volumeL, bool online) {
+    publish_policy::Input in;
+    in.sampleValid = true;
+    in.hasPublished = hasPublished;
+    in.publishAfterReconnect = publishAfterReconnect;
+    in.volumeL = volumeL;
+    in.lastPublishedL = lastPublishedL;
+    in.nowMs = nowMs;
+    in.lastPublishMs = lastPublishMs;
+    in.deltaLiters = 50.0f;
+    in.heartbeatMs = 3600000UL;
+    in.minIntervalMs = 10000UL;
+
+    const publish_policy::Reason reason = publish_policy::decide(in);
+    if (reason == publish_policy::Reason::NONE) {
+      return reason;
+    }
+    if (online && pending == 0) {
+      registerPublished(nowMs, volumeL);
+      publishAfterReconnect = false;
+      ++published;
+      return reason;
+    }
+    enqueue(nowMs, volumeL);
+    return reason;
+  }
+};
+
 }  // namespace
 int main() {
   std::printf("== MovingAverage ==\n");
@@ -269,6 +325,73 @@ int main() {
   in.publishAfterReconnect = true;
   check(publish_policy::decide(in) == publish_policy::Reason::RECONNECT,
         "reconexao: publica imediatamente mesmo sem mudanca");
+
+  // -------------------------------------------------------------------------
+  //  Offline: decisao independente do transporte (fila preserva a amostra)
+  // -------------------------------------------------------------------------
+  std::printf("\n== offline: decisao independente do transporte ==\n");
+
+  Gate gate;
+  gate.step(1000, 1000.0f, true);
+  check(gate.published == 1 && gate.pending == 0,
+        "online: FIRST publica e a fila fica vazia");
+
+  gate.publishAfterReconnect = true;
+  check(gate.step(2000, 1000.0f, false) == publish_policy::Reason::RECONNECT,
+        "offline: politica decide RECONNECT");
+  check(gate.pending == 1 && !gate.publishAfterReconnect,
+        "offline: RECONNECT vira 1 registro e nao fica pendente");
+
+  for (int step = 0; step < 39; ++step) {
+    gate.step(2250 + 250 * (uint32_t)step, (step % 2) ? 1005.0f : 1000.0f, false);
+  }
+  check(gate.pending == 1,
+        "offline ~10 s sem variacao: nada entra por ciclo de 250 ms");
+
+  gate.step(12000, 1080.0f, false);
+  check(gate.pending == 2, "offline: DELTA apos o intervalo minimo enfileira");
+  gate.step(12250, 1140.0f, false);
+  check(gate.pending == 2, "offline: DELTA antes do intervalo minimo espera");
+  gate.step(22000, 1140.0f, false);
+  check(gate.pending == 3, "offline: DELTA apos o intervalo enfileira de novo");
+
+  Gate hb;
+  hb.step(1000, 500.0f, true);
+  hb.publishAfterReconnect = true;
+  hb.step(2000, 500.0f, false);
+  hb.step(2000UL + 3600000UL, 500.0f, false);
+  check(hb.pending == 2 && hb.step(2000UL + 3600000UL, 500.0f, false) ==
+                               publish_policy::Reason::NONE,
+        "offline: heartbeat enfileira uma vez, sem repetir no ciclo seguinte");
+
+  Gate bad;
+  bad.step(1000, 500.0f, true);
+  bad.publishAfterReconnect = true;
+  bad.appendOk = false;
+  bad.step(2000, 500.0f, false);
+  check(bad.pending == 0 && bad.publishAfterReconnect && bad.lastPublishMs == 1000,
+        "falha de gravacao: nada e criado e o baseline nao avanca");
+  bad.appendOk = true;
+  bad.step(2250, 500.0f, false);
+  check(bad.pending == 1 && !bad.publishAfterReconnect,
+        "retentativa: grava uma unica vez e libera o RECONNECT");
+
+  Gate backlog;
+  backlog.step(1000, 500.0f, true);
+  backlog.publishAfterReconnect = true;
+  backlog.step(2000, 500.0f, false);
+  backlog.step(22000, 620.0f, false);
+  backlog.step(33000, 700.0f, true);
+  check(backlog.pending == 3 && backlog.published == 1,
+        "reconexao com backlog: leitura nova entra na fila (ordem preservada)");
+  backlog.pending = 0;
+  backlog.step(45000, 780.0f, true);
+  check(backlog.published == 2, "fila vazia: volta a publicar direto");
+
+  Gate boot;
+  boot.step(1000, 400.0f, false);
+  check(boot.pending == 1 && boot.published == 0,
+        "primeira leitura sem conexao: vai para a fila (FIRST)");
 
   std::printf("\n%s (%d falha(s))\n",
               g_failures == 0 ? "TODOS OS TESTES PASSARAM" : "HOUVE FALHAS",

@@ -1,5 +1,6 @@
 #include <Arduino.h>
 
+#include "clock.h"
 #include "config.h"
 #include "display.h"
 #include "moving_average.h"
@@ -31,6 +32,7 @@ volume::Measurement g_lastMeasurement;
 float g_filteredLiters = 0.0f;
 bool g_hasSample = false;
 uint32_t g_lastSampleMs = 0;
+uint64_t g_lastSampleTimestampMs = 0;
 uint32_t g_lastDiagnosticMs = 0;
 
 static_assert(MOVING_AVERAGE_WINDOW <= MovingAverage::kMaxWindow,
@@ -46,6 +48,9 @@ void sampleAndProcess(uint32_t nowMs) {
   // O display recebe o volume filtrado; a escrita fisica e temporizada.
   g_display.setLiters(g_filteredLiters);
   g_hasSample = true;
+
+  // Timestamp ORIGINAL da medicao (0 enquanto o NTP nao sincroniza).
+  g_lastSampleTimestampMs = device_clock::nowMs();
 }
 
 void printDiagnostics(uint32_t nowMs) {
@@ -66,10 +71,12 @@ void printDiagnostics(uint32_t nowMs) {
                   static_cast<unsigned>(MOVING_AVERAGE_WINDOW));
   }
 
-  Serial.printf(" | wifi=%s | mqtt=%s | publicadas=%lu",
+  Serial.printf(" | wifi=%s | mqtt=%s | hora=%s | publicadas=%lu | fila=%lu",
                 g_wifi.connected() ? "ok" : "off",
                 g_tb.connected() ? "ok" : "off",
-                static_cast<unsigned long>(g_tb.publishCount()));
+                device_clock::synced() ? "ok" : "off",
+                static_cast<unsigned long>(g_tb.publishCount()),
+                static_cast<unsigned long>(g_tb.queuePending()));
 
   Serial.println();
 }
@@ -98,6 +105,10 @@ void printStartup() {
       static_cast<double>(TB_PUBLISH_DELTA_LITERS),
       static_cast<unsigned long>(TB_HEARTBEAT_INTERVAL_MS / 60000UL),
       static_cast<unsigned long>(TB_MIN_PUBLISH_INTERVAL_MS / 1000UL));
+
+  Serial.println(
+      "Fila offline: LittleFS (segmentos com CRC32, replay cronologico)");
+  Serial.println("Telemetria: volume_l + ts (epoch ms) | uptime_s: atributo");
 }
 
 }  // namespace
@@ -111,6 +122,7 @@ void setup() {
   sensor::begin(now);
   g_display.begin(now);
   g_wifi.begin(now);
+  device_clock::begin(now);
   g_tb.begin(now);
 
   g_lastSampleMs = now;
@@ -137,10 +149,14 @@ void loop() {
   // Wi-Fi: reconexao agendada, sem bloquear a medicao nem o display.
   g_wifi.update(now);
 
+  // Relogio: NTP inicia quando o Wi-Fi conecta; sem hora valida nao ha
+  // telemetria nem fila (o timestamp original e obrigatorio).
+  device_clock::update(now, g_wifi.connected());
+
   // ThingsBoard: recebe os valores ja calculados e decide quando publicar.
   TelemetrySample sample;
   sample.volumeL = g_filteredLiters;
-  sample.levelMm = g_lastMeasurement.levelMm;
+  sample.timestampMs = g_lastSampleTimestampMs;
   sample.uptimeS = now / 1000UL;
   sample.valid = g_hasSample;
   g_tb.update(now, sample);

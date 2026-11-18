@@ -139,13 +139,46 @@ constexpr uint32_t MQTT_SOCKET_TIMEOUT_MS = 800;
 constexpr uint16_t MQTT_CONNACK_TIMEOUT_S = 1;
 constexpr uint16_t MQTT_BUFFER_SIZE       = 256;
 
+// ---------------------------------------------------------------------------
+//  Relogio (NTP)
+//
+//  A fila offline guarda o timestamp ORIGINAL da medicao, entao a hora precisa
+//  estar sincronizada antes de publicar ou enfileirar. Sem sincronismo a
+//  telemetria apenas aguarda: nada e gravado com timestamp invalido.
+// ---------------------------------------------------------------------------
+constexpr char NTP_SERVER_1[] = "time.cloudflare.com";
+constexpr char NTP_SERVER_2[] = "time.google.com";
+constexpr char NTP_SERVER_3[] = "pool.ntp.org";
+
+// Deslocamento usado apenas nos logs (horario de Brasilia). O epoch gravado na
+// fila e sempre UTC.
+constexpr int32_t UTC_OFFSET_SECONDS = -3 * 3600;
+
+// Qualquer data a partir de 2024-01-01 indica que o NTP ja ajustou o relogio.
+constexpr uint32_t NTP_MIN_VALID_EPOCH_SECONDS = 1704067200UL;
+
+// ---------------------------------------------------------------------------
+//  ThingsBoard - topicos e chaves
+// ---------------------------------------------------------------------------
+
 // Topico de telemetria do ThingsBoard (autenticacao por device access token).
+// A telemetria leva apenas o timestamp original (`ts`) e o volume.
 constexpr char TB_TELEMETRY_TOPIC[] = "v1/devices/me/telemetry";
 
-// Chaves publicadas na telemetria.
+// Atributos do dispositivo: `uptime_s` fica separado da telemetria e nunca
+// entra na fila offline. E atualizado a cada publicacao de `volume_l` e na
+// reconexao, sempre com o uptime atual - sem temporizador proprio.
+constexpr char TB_ATTRIBUTES_TOPIC[] = "v1/devices/me/attributes";
+
+// Chaves publicadas.
+constexpr char TB_KEY_TS[]     = "ts";
 constexpr char TB_KEY_VOLUME[] = "volume_l";
-constexpr char TB_KEY_LEVEL[]  = "nivel_mm";
-constexpr char TB_KEY_UPTIME[] = "uptime";
+constexpr char TB_KEY_UPTIME[] = "uptime_s";
+
+// Replay da fila offline: orcamento por iteracao do loop, igual ao Ecowitt2TB
+// (mantem o loop responsivo e o display sem travamentos).
+constexpr uint8_t  TB_QUEUE_REPLAY_MAX_RECORDS = 5;
+constexpr uint32_t TB_QUEUE_REPLAY_BUDGET_MS   = 20;
 
 // Politica de publicacao:
 //  - diferenca minima, em litros, para publicar por mudanca significativa;

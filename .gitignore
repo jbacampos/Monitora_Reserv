@@ -4,9 +4,8 @@
 .vscode/launch.json
 .vscode/ipch
 
-# Credenciais reais nunca entram no Git (modelos: *.example)
-include/secrets_test.h
-include/secrets_prod.h
+# Credenciais reais nunca entram no Git (modelo: include/secrets.h.example)
+include/secrets.h
 
 # Artefatos do teste de host
 *.exe
