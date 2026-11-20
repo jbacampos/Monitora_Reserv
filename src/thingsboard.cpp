@@ -3,6 +3,7 @@
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 #include <WiFiClientSecure.h>
+#include <time.h>
 
 #include "config.h"
 #include "credentials.h"
@@ -45,9 +46,21 @@ const char *mqttStateName(int state) {
   return "estado desconhecido";
 }
 
+// Codigos do BearSSL que interessam ao fallback (bearssl_ssl.h):
+//    6     BR_ERR_TOO_LARGE  - o registro nao coube no buffer RX
+//   -1000  _oom_err do core  - nao houve heap para contexto/buffers
+constexpr int kSslRecordTooLarge = 6;
+constexpr int kSslOutOfMemory = -1000;
+
 }  // namespace
 
 void ThingsBoard::begin(uint32_t nowMs) {
+  // Buffers TLS explicitos, SEMPRE antes de qualquer conexao: o padrao do core
+  // (16384, 512) reserva ~17 KB de heap por sessao. Com 4096/512 o RX ainda
+  // cobre com folga o maior registro do broker (1735 B medidos) e o TX cobre o
+  // ClientHello (~300 B) e os PUBLISH do firmware (~100 B).
+  g_transport.setBufferSizes(MQTT_TLS_RX_BUFFER, MQTT_TLS_TX_BUFFER);
+
   // Timeouts curtos: limitam o tempo que uma tentativa pode segurar o loop
   // (resolucao de nome + conexao TCP + espera do CONNACK).
   g_transport.setTrustAnchors(&g_mqttCa);
@@ -56,6 +69,13 @@ void ThingsBoard::begin(uint32_t nowMs) {
   g_mqtt.setServer(TB_HOST, TB_PORT);
   g_mqtt.setSocketTimeout(MQTT_CONNACK_TIMEOUT_S);
   g_mqtt.setBufferSize(MQTT_BUFFER_SIZE);
+
+  Serial.printf("TB: TLS rx=%d B tx=%d B (emergencia %d B) | broker=%s:%u | "
+                "buffer MQTT=%u B\n",
+                MQTT_TLS_RX_BUFFER, MQTT_TLS_TX_BUFFER,
+                MQTT_TLS_RX_BUFFER_FALLBACK, TB_HOST,
+                static_cast<unsigned>(TB_PORT),
+                static_cast<unsigned>(MQTT_BUFFER_SIZE));
 
   // Fila offline: monta o LittleFS sem formatacao automatica e recupera os
   // registros pendentes de execucoes anteriores.
@@ -94,6 +114,16 @@ bool ThingsBoard::connectSession(uint32_t nowMs) {
                 clientId);
 
   const uint32_t startedMs = millis();
+
+  // Data/hora para a validacao X.509. O core so a usa quando setX509Time() e
+  // chamado: sem isso o BearSSL fica sem referencia de tempo e o resultado do
+  // handshake passa a depender de o SNTP ter respondido. Aqui a hora ja e
+  // valida (o chamador so tenta com timestamp != 0).
+  const time_t epochNow = time(nullptr);
+  if (epochNow >= static_cast<time_t>(NTP_MIN_VALID_EPOCH_SECONDS)) {
+    g_transport.setX509Time(epochNow);
+  }
+
   const bool ok = g_mqtt.connect(clientId, ACTIVE_TB_TOKEN, nullptr);
   const uint32_t elapsedMs = millis() - startedMs;
 
@@ -102,12 +132,88 @@ bool ThingsBoard::connectSession(uint32_t nowMs) {
         "[%7.2f s] TB: falha ao conectar (motivo=%s, estado=%d) em %lu ms\n",
         seconds(nowMs), mqttStateName(g_mqtt.state()), g_mqtt.state(),
         static_cast<unsigned long>(elapsedMs));
+    handleTlsFailure(nowMs);
     return false;
   }
 
   Serial.printf("[%7.2f s] TB: conectado em %lu ms\n", seconds(nowMs),
                 static_cast<unsigned long>(elapsedMs));
+  m_lastConnectedMs = nowMs;
+  m_lastSslCode = 0;  // sessao aceita: o proximo erro TLS volta a ser reportado
   return true;
+}
+
+// Fallback dos buffers TLS do MQTT.
+//
+// O broker escolhe a cadeia de certificados, e ela viaja em UM registro TLS que
+// precisa caber inteiro no buffer RX. Se o broker rotacionar a folha ou passar a
+// enviar uma cadeia maior, o BearSSL falha com BR_ERR_TOO_LARGE (codigo 6) e o
+// MQTT nunca conecta - sem esta funcao, a unica saida seria recompilar.
+//
+// Aqui a falha e classificada:
+//   6     -> amplia o RX para MQTT_TLS_RX_BUFFER_FALLBACK e tenta de novo em
+//            MQTT_RECONNECT_MS (nao espera o backoff dobrado);
+//   -1000 -> sem heap para a sessao TLS. Se o RX estava ampliado, volta ao
+//            normal (o buffer menor tem mais chance de caber) e tenta de novo;
+//   outro -> registra o codigo UMA vez por episodio (sem repetir a cada backoff).
+//
+// Em TODOS os casos a sessao que falhou e liberada: o PubSubClient so chama
+// stop() quando o TCP conecta e o CONNACK e ruim; numa falha de handshake o
+// contexto e os buffers (~7,4 KB) ficariam alocados ate a proxima tentativa.
+void ThingsBoard::handleTlsFailure(uint32_t nowMs) {
+  char sslText[96] = {0};
+  const int sslCode = g_transport.getLastSSLError(sslText, sizeof(sslText));
+
+  g_transport.stop();  // devolve contexto + RX + TX da tentativa que falhou
+
+  if (sslCode == kSslRecordTooLarge) {
+    if (!m_rxEscalated) {
+      g_transport.setBufferSizes(MQTT_TLS_RX_BUFFER_FALLBACK,
+                                 MQTT_TLS_TX_BUFFER);
+      m_rxEscalated = true;
+      m_retryNow = true;
+      Serial.printf(
+          "[%7.2f s] TB: registro TLS nao coube em %u B; RX ampliado para %d B "
+          "(nova tentativa em %lu s)\n",
+          seconds(nowMs),
+          static_cast<unsigned>(MQTT_TLS_RX_BUFFER + 325),
+          MQTT_TLS_RX_BUFFER_FALLBACK,
+          static_cast<unsigned long>(MQTT_RECONNECT_MS / 1000UL));
+    } else if (sslCode != m_lastSslCode) {
+      // Nem o valor de emergencia resolveu: o problema e externo ao firmware.
+      // Avisa UMA vez por episodio (o backoff ja repete a tentativa sozinho).
+      m_lastSslCode = sslCode;
+      Serial.printf(
+          "[%7.2f s] TB: registro TLS maior que %u B mesmo com o RX de "
+          "emergencia; recompilar com MQTT_TLS_RX_BUFFER maior\n",
+          seconds(nowMs),
+          static_cast<unsigned>(MQTT_TLS_RX_BUFFER_FALLBACK + 325));
+    }
+    return;
+  }
+
+  if (sslCode == kSslOutOfMemory) {
+    if (m_rxEscalated) {
+      g_transport.setBufferSizes(MQTT_TLS_RX_BUFFER, MQTT_TLS_TX_BUFFER);
+      m_rxEscalated = false;
+      m_retryNow = true;
+      Serial.printf(
+          "[%7.2f s] TB: sem heap para o RX de emergencia (%d B); voltando ao "
+          "buffer normal (%d B)\n",
+          seconds(nowMs), MQTT_TLS_RX_BUFFER_FALLBACK, MQTT_TLS_RX_BUFFER);
+    } else if (sslCode != m_lastSslCode) {
+      m_lastSslCode = sslCode;
+      Serial.printf("[%7.2f s] TB: sem heap para a sessao TLS (%s)\n",
+                    seconds(nowMs), sslText);
+    }
+    return;
+  }
+
+  if (sslCode != 0 && sslCode != m_lastSslCode) {
+    m_lastSslCode = sslCode;
+    Serial.printf("[%7.2f s] TB: TLS falhou (codigo=%d): %s\n", seconds(nowMs),
+                  sslCode, sslText);
+  }
 }
 
 bool ThingsBoard::publishValues(uint32_t nowMs, uint64_t timestampMs,
@@ -253,15 +359,34 @@ void ThingsBoard::update(uint32_t nowMs, const TelemetrySample &sample) {
       m_publishAfterReconnect = true;
     }
 
-    if ((nowMs - m_lastAttemptMs) >= m_retryDelayMs) {
+    // So tenta o TLS com o RELOGIO valido. Medido em campo em 2026-11-20, no
+    // boot seguinte a um reboot controlado: a tentativa saiu 0,1 s depois do
+    // Wi-Fi, antes da resposta do SNTP, e o BearSSL recusou a cadeia com
+    // BR_ERR_X509_EXPIRED (codigo 54, "Certificate is expired or not yet
+    // valid"): sem hora de referencia a janela de validade nao fecha. No boot
+    // anterior a mesma tentativa passou porque o SNTP respondeu durante o
+    // handshake - ou seja, o resultado dependia de uma corrida.
+    // Sem NTP nada seria publicado NEM enfileirado (o timestamp original e
+    // obrigatorio), portanto esperar o relogio nao atrasa telemetria: apenas
+    // elimina um handshake condenado. O aviso "aguardando NTP" (abaixo) ja
+    // explica a espera.
+    const bool clockReady = sample.timestampMs != 0;
+    if (clockReady && (nowMs - m_lastAttemptMs) >= m_retryDelayMs) {
       m_lastAttemptMs = nowMs;
 
       if (!connectSession(nowMs)) {
-        // Backoff: cada falha seguida dobra o intervalo ate o limite, para nao
-        // gastar o loop tentando um broker que esta fora do ar.
-        m_retryDelayMs = m_retryDelayMs * 2UL;
-        if (m_retryDelayMs > MQTT_MAX_RECONNECT_MS) {
-          m_retryDelayMs = MQTT_MAX_RECONNECT_MS;
+        if (m_retryNow) {
+          // Buffers TLS reajustados pelo fallback: nova tentativa sem esperar o
+          // backoff dobrado, senao a correcao so valeria minutos depois.
+          m_retryNow = false;
+          m_retryDelayMs = MQTT_RECONNECT_MS;
+        } else {
+          // Backoff: cada falha seguida dobra o intervalo ate o limite, para nao
+          // gastar o loop tentando um broker que esta fora do ar.
+          m_retryDelayMs = m_retryDelayMs * 2UL;
+          if (m_retryDelayMs > MQTT_MAX_RECONNECT_MS) {
+            m_retryDelayMs = MQTT_MAX_RECONNECT_MS;
+          }
         }
       } else {
         m_retryDelayMs = MQTT_RECONNECT_MS;

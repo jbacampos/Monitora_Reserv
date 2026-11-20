@@ -30,6 +30,14 @@ constexpr const char *ACTIVE_WIFI_PASSWORD =
 constexpr const char *ACTIVE_TB_TOKEN =
     selectValue(TEST_MODE, TB_ACCESS_TOKEN_PROD, TB_ACCESS_TOKEN_TEST);
 
+// Telegram: token do bot e chats autorizados (o segundo e opcional).
+constexpr const char *ACTIVE_TELEGRAM_BOT_TOKEN =
+    selectValue(TEST_MODE, TELEGRAM_BOT_TOKEN_PROD, TELEGRAM_BOT_TOKEN_TEST);
+constexpr const char *ACTIVE_TELEGRAM_CHAT_ID =
+    selectValue(TEST_MODE, TELEGRAM_CHAT_ID_PROD, TELEGRAM_CHAT_ID_TEST);
+constexpr const char *ACTIVE_TELEGRAM_CHAT_ID2 =
+    selectValue(TEST_MODE, TELEGRAM_CHAT_ID2_PROD, TELEGRAM_CHAT_ID2_TEST);
+
 // Host e porta do broker sao unicos para os dois ambientes (MQTT sobre TLS).
 // Nao existe porta 1883 no MoniRes: texto puro nao e usado.
 static_assert(TB_PORT == 8883, "TB_PORT deve ser 8883 (MQTT sobre TLS)");
@@ -61,6 +69,15 @@ constexpr bool wifiCredentialsPending() {
 
 constexpr bool tbTokenPending() {
   return ACTIVE_TB_TOKEN[0] == '\0' || hasPlaceholderPrefix(ACTIVE_TB_TOKEN);
+}
+
+// O bot do Telegram so e consultado quando token e chat autorizado existem. Sem
+// eles o firmware segue normalmente (sensor, display, MQTT, historico e fila).
+constexpr bool telegramCredentialsPending() {
+  return ACTIVE_TELEGRAM_BOT_TOKEN[0] == '\0' ||
+         hasPlaceholderPrefix(ACTIVE_TELEGRAM_BOT_TOKEN) ||
+         ACTIVE_TELEGRAM_CHAT_ID[0] == '\0' ||
+         hasPlaceholderPrefix(ACTIVE_TELEGRAM_CHAT_ID);
 }
 
 // Nome do arquivo de segredos, para as mensagens de Serial. Existe apenas um

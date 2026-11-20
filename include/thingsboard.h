@@ -39,6 +39,13 @@ class ThingsBoard {
   void update(uint32_t nowMs, const TelemetrySample &sample);
 
   bool connected() const { return m_connected; }
+  // Instante (millis) da ultima sessao MQTT ACEITA pelo broker (0 = nenhuma).
+  // Unica fonte da guarda de bloqueio (stall_guard.h) para o reboot controlado.
+  uint32_t lastConnectedMs() const { return m_lastConnectedMs; }
+  // true quando o RX do TLS foi ampliado para MQTT_TLS_RX_BUFFER_FALLBACK por
+  // causa de um registro maior que o normal (o broker mudou a cadeia). Apenas
+  // diagnostico: aparece no log serial e na linha periodica (mqtt=off(rx4096)).
+  bool rxEscalated() const { return m_rxEscalated; }
   uint32_t publishCount() const { return m_publishCount; }
   bool queueReady() const { return m_queue.ready(); }
   uint32_t queuePending() const { return m_queue.pendingRecords(); }
@@ -46,6 +53,10 @@ class ThingsBoard {
 
  private:
   bool connectSession(uint32_t nowMs);
+  // Interpreta o erro de TLS da tentativa que falhou: amplia o RX quando o
+  // registro nao coube, volta ao normal quando nao ha heap e libera os buffers
+  // da tentativa. Chamada apenas de connectSession (caminho de falha).
+  void handleTlsFailure(uint32_t nowMs);
   void drainQueue(uint32_t nowMs);
   bool publishValues(uint32_t nowMs, uint64_t timestampMs, float volumeL,
                      const char *origin);
@@ -62,8 +73,18 @@ class ThingsBoard {
   bool m_queueFullWarned = false;
   uint32_t m_lastAttemptMs = 0;
   uint32_t m_lastPublishMs = 0;
+  // Ultima sessao MQTT aceita (0 = nenhuma). Alimenta a guarda de bloqueio.
+  uint32_t m_lastConnectedMs = 0;
   uint32_t m_publishCount = 0;
   uint32_t m_retryDelayMs = MQTT_RECONNECT_MS;
+  // RX do TLS ampliado (registro maior que o buffer normal) e pedido de nova
+  // tentativa imediata: os buffers foram reajustados e nao vale esperar o
+  // backoff dobrado para saber se o novo tamanho resolve.
+  bool m_rxEscalated = false;
+  bool m_retryNow = false;
+  // Ultimo codigo de TLS ja reportado (evita repetir a mesma linha a cada
+  // tentativa enquanto o broker estiver recusando a sessao).
+  int m_lastSslCode = 0;
   float m_lastPublishedL = 0.0f;
   OfflineQueue m_queue;
 };

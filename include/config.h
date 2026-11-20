@@ -24,6 +24,14 @@
 constexpr bool TEST_MODE = true;  // true = test, false = production
 
 // ---------------------------------------------------------------------------
+//  Versao do firmware - definicao UNICA
+//
+//  Usada pelo /status do Telegram (e disponivel para OTA/telemetria no futuro).
+//  Nao existe outra copia da versao no projeto.
+// ---------------------------------------------------------------------------
+constexpr char FIRMWARE_VERSION[] = "1.0.0";
+
+// ---------------------------------------------------------------------------
 //  Hardware (NodeMCU ESP8266 / ESP-12E)
 // ---------------------------------------------------------------------------
 constexpr uint8_t PIN_SENSOR_ADC  = A0;   // QDY30A
@@ -139,6 +147,60 @@ constexpr uint32_t MQTT_SOCKET_TIMEOUT_MS = 800;
 constexpr uint16_t MQTT_CONNACK_TIMEOUT_S = 1;
 constexpr uint16_t MQTT_BUFFER_SIZE       = 256;
 
+// Buffers TLS do BearSSL, em bytes de DADOS (o core soma 325 B ao RX e 85 B ao
+// TX para o overhead do protocolo antes de alocar). O padrao do core e
+// (16384, 512), que reserva ~17 KB de heap enquanto a sessao TLS existe; os
+// valores abaixo reservam ~5 KB.
+//
+// Dimensionamento medido no broker atual (mqtt.datalog.top:8883, TLS 1.2, o
+// mesmo protocolo maximo do BearSSL):
+//   - maior registro RECEBIDO: 1735 B (Certificate: folha de 1213 B + entrada
+//     vazia). A CA nao trafega: ela e ancora local (datalog_mqtt_ca.h);
+//   - ClientHello ENVIADO: ~211 B (o do BearSSL e da mesma ordem de grandeza);
+//   - maior PUBLISH do firmware: ~100 B (payload de ~70 B em g_payload[192]).
+// RX = 3072 (3397 B alocados com os 325 B de overhead): 1,96x de margem sobre o
+// maior registro medido (1735 B) e 1 KB de heap PERMANENTE devolvido ao sistema.
+// O motivo e a reconexao do MQTT enquanto a sessao TLS do Telegram esta aberta:
+// com o broker fora, so os buffers do MQTT voltam (~8,4 KB), o heap fica em
+// ~13,9 KB e o pico do handshake do MQTT e 3408 (ctx) + 3397 (rx) + 597 (tx) +
+// 342 (socket) + 3064 (validador X.509) = 10 808 B, deixando ~3,1 KB de folga -
+// acima dos TELEGRAM_PEAK_HEADROOM (2 248 B) que o projeto definiu como seguro.
+// Com 4096 o mesmo pico daria 11 832 B e a folga cairia para ~2,0 KB, abaixo do
+// limiar (medido em campo em 2026-11-20: heap 5 464 B com as duas sessoes vivas).
+// Se o broker passar a enviar um registro maior que 3397 B (ex.: cadeia com uma
+// intermediaria a mais), o BearSSL falha com BR_ERR_TOO_LARGE (codigo 6) e a
+// unica saida e recompilar com 4096. 512 de TX cobrem o ClientHello e qualquer
+// PUBLICACAO; o buffer do PubSubClient (MQTT_BUFFER_SIZE) nao depende disto.
+constexpr int MQTT_TLS_RX_BUFFER = 3072;
+constexpr int MQTT_TLS_TX_BUFFER = 512;
+
+// RX de EMERGENCIA, usado SOZINHO quando o broker muda a cadeia e o registro
+// deixa de caber no buffer normal: 4096 + 325 = 4421 B alocados (2,55x de
+// margem sobre os 1735 B medidos). O firmware troca para este valor quando o
+// BearSSL reporta BR_ERR_TOO_LARGE (codigo 6) e volta ao normal se a alocacao
+// falhar por falta de heap (codigo -1000) - ver ThingsBoard::handleTlsFailure.
+// Custo: 1 KB de heap enquanto o MQTT estiver ampliado (e um handshake de
+// 11 832 B, que com a sessao do Telegram aberta deixa ~2,4 KB de folga: o mesmo
+// piso que o projeto ja aceitava antes, acima dos 2 248 B medidos como seguros).
+constexpr int MQTT_TLS_RX_BUFFER_FALLBACK = 4096;
+
+// O core (WiFiClientSecureBearSSL) limita os dois valores a [512, 16384].
+static_assert(MQTT_TLS_RX_BUFFER >= 512 && MQTT_TLS_RX_BUFFER <= 16384,
+              "MQTT_TLS_RX_BUFFER deve estar em [512, 16384]");
+// Acima de 3072 a folga do handshake cai abaixo do limiar documentado acima;
+// subir para 4096 e a saida de EMERGENCIA se o broker mudar a cadeia (o valor
+// continua valido, apenas consome 1 KB a mais de heap permanente).
+static_assert(MQTT_TLS_RX_BUFFER_FALLBACK > MQTT_TLS_RX_BUFFER,
+              "o RX de emergencia deve ser MAIOR que o normal");
+static_assert(MQTT_TLS_RX_BUFFER_FALLBACK >= 2048 &&
+                  MQTT_TLS_RX_BUFFER_FALLBACK <= 16384,
+              "MQTT_TLS_RX_BUFFER_FALLBACK deve estar em [2048, 16384]");
+static_assert(MQTT_TLS_TX_BUFFER >= 512 && MQTT_TLS_TX_BUFFER <= 16384,
+              "MQTT_TLS_TX_BUFFER deve estar em [512, 16384]");
+// O maior registro do broker medido tem ~1,8 KB: nao reduzir o RX abaixo disso.
+static_assert(MQTT_TLS_RX_BUFFER >= 2048,
+              "MQTT_TLS_RX_BUFFER deve cobrir o maior registro do broker (~1,8 KB)");
+
 // ---------------------------------------------------------------------------
 //  Relogio (NTP)
 //
@@ -195,4 +257,257 @@ static_assert(TB_HEARTBEAT_INTERVAL_MS > TB_MIN_PUBLISH_INTERVAL_MS,
               "o heartbeat deve ser maior que o intervalo minimo de publicacao");
 static_assert(MQTT_SOCKET_TIMEOUT_MS < WIFI_RETRY_MS,
               "o timeout do socket deve ser menor que o intervalo de reconexao");
+
+// ---------------------------------------------------------------------------
+//  Historico diario (recurso auxiliar)
+//
+//  O volume e ESTIMADO, nao medido: perder um dia ocasionalmente e aceitavel.
+//  O historico nunca bloqueia sensor, display, MQTT, fila offline ou Telegram,
+//  nunca formata o LittleFS e nao usa fila de recuperacao.
+//
+//  Retencao e layout binario ficam em history_record.h (30 slots, registro de
+//  52 B, tabela de 1600 B); aqui ficam apenas temporizacao e limiares.
+// ---------------------------------------------------------------------------
+constexpr uint32_t HIST_SAMPLE_INTERVAL_MS   = 10000;   // amostragem nominal do historico
+constexpr uint32_t HIST_SNAPSHOT_INTERVAL_MS = 300000;  // snapshot do dia corrente (5 min)
+constexpr uint32_t HIST_RETRY_INTERVAL_MS    = 60000;   // nova tentativa de gravar o dia
+constexpr uint32_t HIST_GAP_SECONDS          = 20;      // 2 acrescimos sem amostra
+
+// Limiar de classificacao COMPLETO: amostragem e cobertura temporal do dia.
+constexpr float HIST_COMPLETE_RATIO = 0.995f;
+
+// Espaco livre minimo para iniciar uma gravacao, em blocos do LittleFS. E uma
+// heuristica (nao uma garantia): cobre o bloco de dados + commit dos metadados
+// e preserva a margem que a fila offline exige. Ajustar se o blockSize real
+// (FSInfo::blockSize) nao for 4096 B.
+constexpr uint8_t HIST_MIN_FREE_BLOCKS = 8;
+
+static_assert(HIST_SAMPLE_INTERVAL_MS % 1000UL == 0,
+              "HIST_SAMPLE_INTERVAL_MS deve ser multiplo de 1 s");
+static_assert(HIST_GAP_SECONDS == 2 * (HIST_SAMPLE_INTERVAL_MS / 1000UL),
+              "HIST_GAP_SECONDS deve ser o dobro do intervalo de amostragem");
+static_assert(HIST_SNAPSHOT_INTERVAL_MS > HIST_SAMPLE_INTERVAL_MS,
+              "o snapshot deve ser mais lento que a amostragem");
+static_assert(HIST_COMPLETE_RATIO > 0.0f && HIST_COMPLETE_RATIO <= 1.0f,
+              "HIST_COMPLETE_RATIO deve estar em (0, 1]");
+static_assert(HIST_MIN_FREE_BLOCKS > 0, "HIST_MIN_FREE_BLOCKS deve ser positivo");
+
+// ---------------------------------------------------------------------------
+//  Telegram (Bot API, HTTPS direto no ESP8266, sem servico intermediario)
+//
+//  O modulo consulta getUpdates a cada TELEGRAM_POLL_INTERVAL_MS e responde
+//  apenas aos chats autorizados (include/secrets.h). Nada aqui e bloqueante por
+//  mais que TELEGRAM_RESPONSE_TIMEOUT_MS. A sessao TLS e REAPROVEITADA entre
+//  consultas (ver TELEGRAM_PERSISTENT_SESSION) e renovada por idade; ver
+//  TELEGRAM_SESSION_MAX_AGE_MS e a liberacao da sessao morta em telegram.cpp.
+// ---------------------------------------------------------------------------
+constexpr char TELEGRAM_HOST[]    = "api.telegram.org";
+constexpr uint16_t TELEGRAM_PORT  = 443;
+
+// Intervalo entre consultas (contado do INICIO da consulta anterior, o que
+// garante que nunca existam duas consultas simultaneas).
+constexpr uint32_t TELEGRAM_POLL_INTERVAL_MS = 20000UL;
+
+// Limites de tempo de UMA consulta, incluindo DNS, handshake TLS e leitura da
+// resposta HTTP. O core do ESP8266 faz o DNS do connect com timeout fixo de
+// 10 s; por isso o nome e resolvido ANTES com WiFi.hostByName(), limitado a
+// TELEGRAM_DNS_TIMEOUT_MS (o resultado fica no cache do lwIP e o connect nao
+// repete a consulta).
+constexpr uint16_t TELEGRAM_DNS_TIMEOUT_MS      = 1500;
+constexpr uint16_t TELEGRAM_SOCKET_TIMEOUT_MS   = 2500;
+constexpr uint32_t TELEGRAM_RESPONSE_TIMEOUT_MS = 3000UL;
+
+// Buffers TLS do Telegram, em bytes de DADOS (o core soma 325 B ao RX e 85 B ao
+// TX antes de alocar). Dimensionamento medido em 2026-11-19 em api.telegram.org
+// (TLS 1.2): a cadeia de certificados chega em UM registro de 3919 B (folha
+// 1698 B + intermediaria 1236 B + raiz 969 B).
+//
+// RX = 4096 (4421 B alocados): cabe o registro de 3919 B com 177 B de folga e
+// reduz em 1024 B o pico de DRAM do handshake, que e o que limita a operacao
+// (ver TELEGRAM_MIN_FREE_HEAP). _alloc_iobuf() tenta IRAM ANTES da DRAM: se os
+// 4421 B couberem em IRAM o pico de DRAM cai ~4,4 KB. O diagnostico mostra qual
+// dos dois aconteceu (delta de "heap(pos-connect)").
+//
+// TX = 512 (597 B): cobre o ClientHello (~300 B) e o POST de uma resposta
+// (~400 B); 512 e o menor valor aceito pelo core.
+// Os buffers do MQTT (MQTT_TLS_RX_BUFFER/TX) NAO mudam.
+constexpr int TELEGRAM_TLS_RX_BUFFER = 4096;
+constexpr int TELEGRAM_TLS_TX_BUFFER = 512;
+
+// Corpo HTTP maximo aceito. getUpdates com limit=1 devolve ~700 B (mensagem de
+// texto) e sendMessage ~400 B; 2048 B e o teto que o leitor nunca ultrapassa
+// (resposta maior e descartada como falha, sem truncar JSON).
+constexpr size_t TELEGRAM_BODY_MAX = 2048;
+
+// Maior bloco contiguo exigido para CRIAR a sessao TLS. Necessidade real medida
+// em 2026-11-19: o core aloca, em sequencia, contexto do cliente (3408 B) +
+// buffer RX (4421 B) + buffer TX (597 B) = 8 426 B (+ ~24 B de cabecalhos do
+// alocador). O validador X.509 (3064 B) vem de outro bloco, e por isso o gate de
+// heap LIVRE (abaixo) e igualmente obrigatorio. 9 216 B = 8 426 + ~790 de folga.
+// Observacao de campo: com o MQTT conectado o bloco fica em ~14,2 KB; com o
+// broker fora do ar fica em ~10 KB (por isso nao se usa 12 288 aqui).
+constexpr size_t TELEGRAM_MIN_FREE_BLOCK = 9216;
+
+// Piso de EMERGENCIA do maior bloco contiguo, usado APENAS para recriar uma
+// sessao que acabou de morrer (ver TELEGRAM_GATE_RECOVERY_PERIOD_MS). O piso
+// normal acima protege a PRIMEIRA sessao, quando o heap ainda esta inteiro.
+//
+// Quando a sessao cai (queda do socket, erro de HTTP ou simplesmente o servidor
+// fechando a conexao ociosa), o bloco que ela ocupava volta para o heap como um
+// buraco do tamanho exato da sessao. Medido em campo em 2026-11-20: buraco de
+// 8 976 B com 14 656 B livres - ou seja, 240 B ABAIXO do piso normal e 550 B
+// ACIMA da necessidade real (8 426 B de alocacao + ~24 B de cabecalhos). Sem
+// este piso o gate (que so vale quando a sessao precisa ser CRIADA) ficava
+// fechado para sempre: o log repetia `tg=adiado(8976B)` por horas e /help e
+// /status nunca eram respondidos, embora o resto do firmware continuasse
+// publicando. 8 704 B = 8 426 + ~278 B de folga.
+constexpr size_t TELEGRAM_MIN_FREE_BLOCK_RECOVERY = 8704;
+
+// Menor heap LIVRE TOTAL aceito para tentar uma consulta. O maior bloco sozinho
+// NAO basta: medido em 2026-11-19, o handshake consumia 9792 B (contexto do
+// cliente BearSSL + buffers RX=5120/TX + socket) MAIS 3064 B do validador X.509
+// durante a validacao da cadeia (liberado antes de connect() retornar), ou seja
+// ~12,9 KB no pico. Com 14696 B livres no inicio do poll o pico deixava ~1,8 KB
+// para o lwIP/WiFi e o firmware morreu em memcpy(NULL) no contexto sys
+// (exception 29, StoreProhibited).
+//
+// Pico REAL de DRAM durante o handshake, medido em 2026-11-19 com RX = 4096:
+// delta de "heap(pos-connect)" = -8768 B (contexto 3408 + RX 4421 + TX 597 +
+// socket ~342) MAIS o validador X.509 (3064 B), liberado antes de connect()
+// retornar. O RX ficou em DRAM (nao em IRAM).
+constexpr size_t TELEGRAM_HANDSHAKE_PEAK = 11832;
+
+// Folga minima exigida no pico para o lwIP/WiFi. Medido: 1 550 B livres = crash
+// (memcpy(NULL) no contexto sys), 1 848 B = handshake degradado, 2 040 B =
+// sobreviveu. 2 248 B fica acima do pior caso que sobreviveu.
+constexpr size_t TELEGRAM_PEAK_HEADROOM = 2248;
+
+// Menor heap LIVRE TOTAL aceito para CRIAR a sessao TLS (= pico + folga).
+// Reaproveitar a sessao aberta nao passa por este gate: nao aloca nada.
+// 14080 B: o device opera com ~15,7 KB livres (MQTT conectado, RX=3072) e
+// ~7,5 KB livres enquanto a sessao TLS do Telegram esta aberta (com o RX antigo
+// de 4096 eram ~14,7 e ~5,5 KB - o KB devolvido pelo MQTT aparece aqui).
+constexpr size_t TELEGRAM_MIN_FREE_HEAP =
+    TELEGRAM_HANDSHAKE_PEAK + TELEGRAM_PEAK_HEADROOM;
+
+// Sessao TLS entre consultas.
+//   true  -> a sessao e criada UMA vez (no primeiro poll, com o heap inteiro) e
+//            REAPROVEITADA nas seguintes: nenhuma alocacao por consulta, nenhum
+//            handshake, nenhuma fragmentacao nova. Custo medido em 2026-11-19:
+//            ~8,8 KB residentes (heap livre cai de ~16,3 para ~7,5 KB com o RX
+//            do MQTT em 3072). O servidor fecha a conexao com ~1 h de idade, por
+//            isso a renovacao preventiva (TELEGRAM_SESSION_MAX_AGE_MS) e a
+//            liberacao da sessao morta acontecem antes do gate medir o heap.
+//   false -> desenho antigo (cria e destroi a cada 20 s). Medido: cada consulta
+//            deixa um buraco de ~8,5 KB (contexto+RX+TX) e o maior bloco cai
+//            abaixo do piso, parando as consultas depois de 1-2 polls.
+// Reversivel: basta voltar para false.
+constexpr bool TELEGRAM_PERSISTENT_SESSION = true;
+
+// DIAGNOSTICO - periodo minimo entre dois avisos de heap insuficiente.
+// O adiamento NAO consome o intervalo de polling: o gate continua sendo
+// reavaliado a cada loop(). Apenas a MENSAGEM e limitada, para o log nao
+// repetir a mesma linha a cada iteracao do loop.
+constexpr uint32_t TELEGRAM_HEAP_WARN_PERIOD_MS = 300000UL;  // 5 min
+
+// DIAGNOSTICO/RECUPERACAO - tempo minimo com o gate fechado antes de UMA
+// tentativa de recriar a sessao com o piso de emergencia. O gate e reavaliado a
+// cada loop() e nao consome o intervalo de polling, portanto sem este atraso a
+// tentativa se repetiria a cada iteracao e cada falha custaria um handshake
+// completo. Uma tentativa por minuto deixa o bot voltar a responder em ate ~1
+// min depois de perder a sessao, sem martelar a Bot API enquanto ela estiver
+// inacessivel.
+constexpr uint32_t TELEGRAM_GATE_RECOVERY_PERIOD_MS = 60000UL;  // 1 min
+
+// Idade maxima da sessao TLS antes de RECRIA-LA DE PROPOSITO. Medido em campo em
+// 2026-11-20, em duas capturas independentes (uptime 3 640 s e 3 660 s): o
+// api.telegram.org encerra a conexao com ~1 h de idade, MESMO com keep-alive a
+// cada 20 s. Prova: a sessao foi reaproveitada por 182 consultas (3 620 s de
+// idade, sem nenhum handshake - "etapa1 handshake ok em=0 ms") e caiu 20 s
+// depois de uma resposta 200 normal.
+//
+// Renovar antes troca uma queda descontrolada por um fechamento previsivel. O
+// fechamento e barato porque acontece DEPOIS de a consulta terminar e ANTES de o
+// gate medir o heap: os ~8,4 KB voltam ao heap e a consulta seguinte recria a
+// sessao com o heap inteiro.
+constexpr uint32_t TELEGRAM_SESSION_MAX_AGE_MS = 50UL * 60UL * 1000UL;  // 50 min
+
+static_assert(TELEGRAM_SESSION_MAX_AGE_MS >= 5UL * TELEGRAM_POLL_INTERVAL_MS,
+              "renovar a sessao a cada poucos polls nao faz sentido");
+static_assert(TELEGRAM_SESSION_MAX_AGE_MS < 3600000UL,
+              "o servidor fecha a sessao com ~1 h: renovar antes disso");
+
+// ---------------------------------------------------------------------------
+//  Guarda de bloqueio - reboot controlado
+//
+//  Os dois servicos externos podem ficar bloqueados SEM prazo: o Telegram quando
+//  o gate de heap nao abre (fragmentacao) e o MQTT quando o broker/TLS nao aceita
+//  a sessao. Nenhum dos dois tem prazo que reabra o caminho sozinho (o gate e
+//  reavaliado a cada loop() e o MQTT ja usa backoff ate MQTT_MAX_RECONNECT_MS).
+//  O reboot devolve o heap inteiro e refaz as sessoes TLS do zero.
+//
+//  Regras: so conta com Wi-Fi conectado e fora da carencia do boot; nao conta
+//  quando as credenciais estao pendentes (nao ha o que reconectar); avisa uma vez
+//  ao passar de STALL_GUARD_FIRST_WARN_MS e reinicia ao atingir o limite.
+//
+//  Custo de um reboot: uptime volta a zero, o historico do dia perde o acumulado
+//  desde o ultimo snapshot (ate HIST_SNAPSHOT_INTERVAL_MS) e a fila offline e
+//  preservada (LittleFS, com CRC e reparo no boot).
+// ---------------------------------------------------------------------------
+constexpr uint32_t STALL_GUARD_GRACE_MS = 60000UL;  // 1 min apos o boot
+constexpr uint32_t STALL_GUARD_FIRST_WARN_MS = 600000UL;  // 10 min: primeiro aviso
+constexpr uint32_t TELEGRAM_STALL_REBOOT_MS = 1800000UL;  // 30 min sem consulta ok
+constexpr uint32_t MQTT_STALL_REBOOT_MS = 1800000UL;      // 30 min sem sessao
+
+static_assert(STALL_GUARD_GRACE_MS >= TELEGRAM_POLL_INTERVAL_MS,
+              "a carencia deve cobrir pelo menos um intervalo de polling");
+static_assert(STALL_GUARD_FIRST_WARN_MS >= STALL_GUARD_GRACE_MS,
+              "o primeiro aviso nao pode ser anterior a carencia");
+static_assert(TELEGRAM_STALL_REBOOT_MS > STALL_GUARD_FIRST_WARN_MS,
+              "o reboot deve vir depois do aviso");
+static_assert(TELEGRAM_STALL_REBOOT_MS > TELEGRAM_GATE_RECOVERY_PERIOD_MS,
+              "a recuperacao do gate deve ter chance antes do reboot");
+static_assert(MQTT_STALL_REBOOT_MS > MQTT_MAX_RECONNECT_MS,
+              "o backoff do MQTT deve ter chance antes do reboot");
+static_assert(TELEGRAM_STALL_REBOOT_MS <= 7200000UL && MQTT_STALL_REBOOT_MS <= 7200000UL,
+              "bloqueio de mais de 2 h nao deve esperar o reboot");
+
+// DIAGNOSTICO - instante da amostra de heap depois que a consulta termina
+// (sessao TLS ja destruida). Da tempo para o lwIP devolver os pbufs e para o
+// alocador fundir os blocos livres.
+constexpr uint32_t TELEGRAM_POST_POLL_SAMPLE_MS = 5000UL;  // 5 s
+
+// Comando recebido: texto util (o resto e ignorado).
+constexpr size_t TELEGRAM_TEXT_MAX = 64;
+
+// Aviso de boot (mensagem enviada uma vez a cada boot). Cada consulta tenta
+// entrega-lo; depois deste numero de tentativas o aviso e descartado ate o
+// proximo boot. Nada e persistido em flash.
+constexpr uint8_t TELEGRAM_BOOT_NOTICE_MAX_ATTEMPTS = 3;
+
+static_assert(TELEGRAM_PORT == 443, "TELEGRAM_PORT deve ser 443 (HTTPS)");
+static_assert(TELEGRAM_TLS_RX_BUFFER >= 512 && TELEGRAM_TLS_RX_BUFFER <= 16384,
+              "TELEGRAM_TLS_RX_BUFFER deve estar em [512, 16384]");
+static_assert(TELEGRAM_TLS_TX_BUFFER >= 512 && TELEGRAM_TLS_TX_BUFFER <= 16384,
+              "TELEGRAM_TLS_TX_BUFFER deve estar em [512, 16384]");
+// A cadeia do Telegram medida tem 3919 B em um registro: nao reduzir.
+static_assert(TELEGRAM_TLS_RX_BUFFER >= 4096,
+              "TELEGRAM_TLS_RX_BUFFER deve cobrir a cadeia do Telegram (3919 B)");
+static_assert(TELEGRAM_RESPONSE_TIMEOUT_MS < TELEGRAM_POLL_INTERVAL_MS,
+              "o timeout da resposta deve caber no intervalo de polling");
+static_assert(TELEGRAM_BODY_MAX <= 4096, "corpo HTTP maximo acima do razoavel");
+// O piso de heap livre tem de cobrir o pico do handshake (bloco + validacao).
+static_assert(TELEGRAM_MIN_FREE_HEAP > TELEGRAM_MIN_FREE_BLOCK,
+              "TELEGRAM_MIN_FREE_HEAP deve ser maior que o bloco minimo");
+// O piso de emergencia so pode ser MENOR que o normal: ele existe para o buraco
+// deixado pela sessao anterior caber na recriacao, nunca para afrouxar o gate.
+static_assert(TELEGRAM_MIN_FREE_BLOCK_RECOVERY < TELEGRAM_MIN_FREE_BLOCK,
+              "o piso de emergencia deve ser menor que o piso normal");
+// Cobre 8 426 B de alocacao + cabecalhos do alocador (medido: 8 450 B).
+static_assert(TELEGRAM_MIN_FREE_BLOCK_RECOVERY >= 8576,
+              "o piso de emergencia deve cobrir a alocacao real da sessao");
+// Uma recuperacao por loop seria um handshake por iteracao.
+static_assert(TELEGRAM_GATE_RECOVERY_PERIOD_MS >= TELEGRAM_POLL_INTERVAL_MS,
+              "a recuperacao nao pode ser mais frequente que o polling");
+
 

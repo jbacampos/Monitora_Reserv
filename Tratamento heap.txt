@@ -1,0 +1,25 @@
+## 4. Plano de redução de fragmentação (opções, com tradeoffs)
+
+Nada foi alterado — estamos em modo plano. Ordem por relação ganho/risco:
+
+__A. Eliminar o `malloc` dos logs longos__ — trocar `Serial.printf` do `printDiagnostics` (e do `printStartup`) por um helper com buffer fixo (o mesmo padrão do `diagPrintf` em `telegram.cpp:152`, 192-256 B). Ganho: ~2 000 malloc/free por hora a menos. Risco: baixo; exige conferir que cada linha caiba no buffer (ou dividir em duas).
+
+__B. Uma abertura de arquivo em vez de três no snapshot__ (`history.cpp:482-499`) — abrir `"r+"`, gravar e reler com `seek(0)`. Ganho: 2 aberturas a menos a cada 5 min. Risco: baixo (o `offline_queue.cpp:408` já usa `"r+"` + `truncate` no mesmo LittleFS).
+
+__C. Reduzir o bloco permanente do MQTT__ — `MQTT_TLS_RX_BUFFER` de 4096 → 2048/3072 (maior registro medido: 1 735 B, `config.h:157`). Ganho: 2 KB de folga contígua permanente, o que aumenta a chance de o buraco do Telegram passar do piso normal (9 216 B) sem precisar do piso de emergência. Risco: menos margem se o broker mandar registro maior (o `static_assert` de 2048 já existe). __Não__ é possível reduzir o RX do Telegram: a cadeia mede 3 919 B e há `static_assert` em 4096.
+
+__D. Não usar `new`/`delete` do `WiFiClientSecure` por sessão__ — criar o objeto uma vez em `.bss` e `stop()` entre sessões (o core libera ctx/buffers, que são o que importa). Ganho: pequeno (~100 B), complexidade baixa; cuidado para chamar `setBufferSizes/setTrustAnchors` só uma vez no `begin`.
+
+__E. Atacar a causa raiz do churn__ — descobrir __por que__ a sessão cai. O diagnóstico já registra etapa/causa/hex da resposta (`diagNoteFail`, `g_failCause`); basta correlacionar o padrão de queda (ex.: sempre ~N min após abrir → idle timeout do servidor). Se for previsível, reconectar *proativamente* antes do timeout é pior (introduz o churn de propósito); manter a sessão viva com o poll de 20 s é o caminho, e a recuperação que implementamos já cobre as quedas inevitáveis.
+
+__F. Última linha, se os logs mostrarem que o buraco não se recupera__ — reboot controlado quando o maior bloco ficar abaixo do piso de emergência por mais de X minutos, registrando o motivo via `boot_reason.h` (a infraestrutura de classificação de reset já existe). Tradeoff: perde o MQTT/fila por alguns segundos, mas devolve o heap inteiro ao invés de conviver com um bot mudo.
+
+Minha recomendação: __A + B__ (baratos, sem risco funcional), __C__ se você aceitar menos margem no MQTT, e acompanhar o log com o `diagHeap` que já existe para ver se a taxa de queda da sessão cai ou se permanece num período fixo (item E).
+
+Cline has a question:
+
+Como você quer seguir com a redução de fragmentação? (Nada foi alterado ainda — é preciso alternar para o modo Act para implementar.)
+
+Implementar A + B (remover malloc dos logs longos e reduzir aberturas de arquivo no snapshot)Implementar A + B + C (inclui reduzir o RX do MQTT para 2048/3072 e ajustar o static_assert/testes)Implementar A + B + F (inclui reboot controlado quando o bloco ficar abaixo do piso de emergência por X minutos)Só investigar por que a sessão TLS do Telegram cai (correlacionar o log de diagnóstico, sem mudar código)Nada por enquanto — a recuperação do gate já basta
+
+Thinking

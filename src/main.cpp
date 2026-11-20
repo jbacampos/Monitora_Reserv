@@ -2,11 +2,16 @@
 
 #include "clock.h"
 #include "config.h"
+#include "credentials.h"
 #include "display.h"
+#include "history.h"
 #include "moving_average.h"
 #include "sensor.h"
 #include "simulator.h"
+#include "stall_guard.h"
+#include "telegram.h"
 #include "thingsboard.h"
+#include "uptime.h"
 #include "volume.h"
 #include "wifi_manager.h"
 
@@ -27,6 +32,11 @@ MovingAverage g_volumeFilter(MOVING_AVERAGE_WINDOW);
 DisplayManager g_display;
 WiFiManager g_wifi;
 ThingsBoard g_tb;
+History g_history;
+Telegram g_telegram;
+
+// Uptime acumulado (imune ao rollover de millis()) e a ultima medicao.
+UptimeCounter g_uptime;
 
 volume::Measurement g_lastMeasurement;
 float g_filteredLiters = 0.0f;
@@ -71,12 +81,33 @@ void printDiagnostics(uint32_t nowMs) {
                   static_cast<unsigned>(MOVING_AVERAGE_WINDOW));
   }
 
+  // `mqtt` mostra tambem o RX de emergencia quando ativo (off(rx4096)): sem isso
+  // uma sessao recusada por registro grande pareceria apenas "broker fora".
+  char mqttState[12];
+  snprintf(mqttState, sizeof(mqttState), "%s%s",
+           g_tb.connected() ? "ok" : "off",
+           g_tb.rxEscalated() ? "(rx4096)" : "");
+
   Serial.printf(" | wifi=%s | mqtt=%s | hora=%s | publicadas=%lu | fila=%lu",
-                g_wifi.connected() ? "ok" : "off",
-                g_tb.connected() ? "ok" : "off",
+                g_wifi.connected() ? "ok" : "off", mqttState,
                 device_clock::synced() ? "ok" : "off",
                 static_cast<unsigned long>(g_tb.publishCount()),
                 static_cast<unsigned long>(g_tb.queuePending()));
+
+  Serial.printf(" | hist=%s",
+                !g_history.ready() ? "off"
+                                   : (g_history.degraded() ? "degradado" : "ok"));
+
+  // Heap livre/bloco contiguo: e o insumo do roteiro de teste do Telegram
+  // (antes e depois das consultas). `tg` resume o modulo sem expor credenciais:
+  // off / adiado(<bloco>B) / aguardando / ultima=<s>s (tempo desde o INICIO da
+  // ultima consulta). Antes "ok" significava apenas "ja houve uma consulta",
+  // o que escondia um gate de heap fechado.
+  char tgState[24];
+  g_telegram.stateText(tgState, sizeof(tgState), nowMs);
+  Serial.printf(" | heap=%u/%u | tg=%s",
+                static_cast<unsigned>(ESP.getFreeHeap()),
+                static_cast<unsigned>(ESP.getMaxFreeBlockSize()), tgState);
 
   Serial.println();
 }
@@ -109,6 +140,19 @@ void printStartup() {
   Serial.println(
       "Fila offline: LittleFS (segmentos com CRC32, replay cronologico)");
   Serial.println("Telemetria: volume_l + ts (epoch ms) | uptime_s: atributo");
+  Serial.printf("Historico: %u dias | snapshot a cada %lu min | amostragem %lu s\n",
+                static_cast<unsigned>(history_record::SLOTS),
+                static_cast<unsigned long>(HIST_SNAPSHOT_INTERVAL_MS / 60000UL),
+                static_cast<unsigned long>(HIST_SAMPLE_INTERVAL_MS / 1000UL));
+
+  Serial.printf(
+      "Guarda: TG %lu min | MQTT %lu min | aviso %lu min | carencia %lu s | "
+      "renovacao TG %lu min\n",
+      static_cast<unsigned long>(TELEGRAM_STALL_REBOOT_MS / 60000UL),
+      static_cast<unsigned long>(MQTT_STALL_REBOOT_MS / 60000UL),
+      static_cast<unsigned long>(STALL_GUARD_FIRST_WARN_MS / 60000UL),
+      static_cast<unsigned long>(STALL_GUARD_GRACE_MS / 1000UL),
+      static_cast<unsigned long>(TELEGRAM_SESSION_MAX_AGE_MS / 60000UL));
 }
 
 }  // namespace
@@ -119,11 +163,24 @@ void setup() {
 
   const uint32_t now = millis();
 
+  // O uptime passa a ser acumulado a partir daqui (nao usa millis() direto).
+  g_uptime.begin(now);
+
   sensor::begin(now);
   g_display.begin(now);
   g_wifi.begin(now);
   device_clock::begin(now);
-  g_tb.begin(now);
+  g_tb.begin(now);  // monta o LittleFS (sem formatacao automatica)
+
+  // Historico depois do ThingsBoard: reutiliza o LittleFS ja montado pela fila.
+  g_history.begin(now);
+
+  // Telegram: apenas estado (nenhuma conexao no setup). A primeira consulta a
+  // Bot API acontece TELEGRAM_POLL_INTERVAL_MS depois do boot.
+  g_telegram.begin(now);
+
+  // Guarda de bloqueio: nenhum reboot nos primeiros STALL_GUARD_GRACE_MS.
+  stall_guard::begin(now);
 
   g_lastSampleMs = now;
 
@@ -136,6 +193,11 @@ void setup() {
 
 void loop() {
   const uint32_t now = millis();
+
+  // Acumula o uptime em toda iteracao: o delta e wrap-safe, portanto o valor
+  // continua correto depois do rollover de millis() e dentro das consultas do
+  // Telegram que bloqueiam alguns segundos.
+  g_uptime.update(now);
 
   // Aquisicao a cada SAMPLE_INTERVAL_MS.
   if ((now - g_lastSampleMs) >= SAMPLE_INTERVAL_MS) {
@@ -157,15 +219,46 @@ void loop() {
   TelemetrySample sample;
   sample.volumeL = g_filteredLiters;
   sample.timestampMs = g_lastSampleTimestampMs;
-  sample.uptimeS = now / 1000UL;
+  sample.uptimeS = g_uptime.seconds();
   sample.valid = g_hasSample;
   g_tb.update(now, sample);
+
+  // Historico diario: auxiliar e independente da comunicacao. Usa o mesmo
+  // timestamp da medicao que a telemetria recebeu.
+  g_history.update(now, device_clock::synced(), g_lastSampleTimestampMs,
+                   g_filteredLiters, g_hasSample);
+
+  // Telegram: primeira consulta a Bot API TELEGRAM_POLL_INTERVAL_MS depois do
+  // boot. Recebe o MESMO volume enviado ao ThingsBoard, o uptime acumulado
+  // (imune ao rollover de millis()) e o historico (unica fonte dos agregados).
+  // A consulta e limitada em tempo e nao altera nenhum outro modulo.
+  TelegramContext telegramContext;
+  telegramContext.volumeL = g_filteredLiters;
+  telegramContext.uptimeS = g_uptime.seconds();
+  telegramContext.sampleValid = g_hasSample;
+  telegramContext.history = &g_history;
+  g_telegram.update(now, telegramContext);
 
   // Diagnostico em frequencia propria, independente da aquisicao.
   if ((now - g_lastDiagnosticMs) >= DIAGNOSTIC_INTERVAL_MS) {
     g_lastDiagnosticMs = now;
     printDiagnostics(now);
   }
+
+  // Guarda de bloqueio: Telegram ou MQTT sem sucesso por tempo demais nao se
+  // recuperam sozinhos (heap fragmentado / broker recusando a sessao). O reboot
+  // e a ultima saida e devolve o heap inteiro. Sem Wi-Fi, nada e contado.
+  stall_guard::Input guardInput;
+  guardInput.wifiConnected = g_wifi.connected();
+  guardInput.telegramEnabled = g_telegram.enabled();
+  guardInput.mqttEnabled = !tbTokenPending();
+  guardInput.telegramLastOkMs = g_telegram.lastSuccessMs();
+  guardInput.mqttLastOkMs = g_tb.lastConnectedMs();
+  // Carimbo NOVO: os modulos acima podem ter bloqueado (a consulta do Telegram
+  // segura ~1,4 s) e marcar millis() maior que o `now` do inicio do loop. Com o
+  // `now` defasado a conta do silencio ficava negativa e a guarda reiniciava o
+  // ESP logo depois do primeiro /help (medido em campo em 2026-11-20).
+  stall_guard::update(millis(), guardInput);
 
   // Espaco livre para os proximos modulos assincronos: Telegram, alertas, OTA
   // e persistencia de configuracoes.
