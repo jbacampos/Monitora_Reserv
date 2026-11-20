@@ -888,7 +888,7 @@ void Telegram::update(uint32_t nowMs, const TelegramContext &context) {
   //      duas consultas, sessionReady() fica false mas o contexto e os buffers
   //      continuam alocados. Medido em campo (2026-11-20): maior bloco=5240 B e
   //      heap=5544 B com a sessao morta PRESA - o gate recusava para sempre (o
-  //      piso de emergencia nunca disparava, 5240 < 8704) e os ~8,4 KB ficavam
+  //      piso de emergencia nunca disparava, 5240 < 6144) e os ~8,4 KB ficavam
   //      presos ate o proximo reboot. Liberar aqui devolve o bloco e a consulta
   //      segue no MESMO ciclo: recuperacao em 0 s, nao em 1 min.
   //
@@ -933,9 +933,11 @@ void Telegram::update(uint32_t nowMs, const TelegramContext &context) {
 
   // Dois pisos de bloco contiguo:
   //   normal     - criar a sessao com o heap inteiro (primeira consulta do boot);
-  //   emergencia - RECRIAR a sessao que acabou de cair. O buraco deixado por ela
-  //                tem o tamanho exato da sessao (campo: 8 976 B) e pode ficar
-  //                abaixo do piso normal (9 216 B) sem ser insuficiente.
+  //   emergencia - RECRIAR a sessao que acabou de cair (segunda chance).
+  // Os DOIS ficam ABAIXO do buraco que a sessao deixa ao ser fechada
+  // (TELEGRAM_SESSION_HOLE_BYTES): era exatamente isso que faltava em 2026-11-20,
+  // quando o buraco de 8 496 B ficou abaixo dos pisos 9 216/8 704 e o gate nunca
+  // mais reabria (`tg=adiado(8496B)` ate a guarda reiniciar).
   // O piso de heap LIVRE TOTAL e o mesmo nos dois casos: e ele que protege o
   // lwIP/WiFi no pico do handshake.
   bool canPoll = sessionReady() ||

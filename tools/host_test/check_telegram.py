@@ -90,6 +90,8 @@ CFG = read_constants(
         "TELEGRAM_RESPONSE_TIMEOUT_MS",
         "TELEGRAM_TLS_RX_BUFFER",
         "TELEGRAM_TLS_TX_BUFFER",
+        "TELEGRAM_SESSION_BYTES",
+        "TELEGRAM_SESSION_HOLE_BYTES",
         "TELEGRAM_BODY_MAX",
         "TELEGRAM_MIN_FREE_BLOCK",
         "TELEGRAM_MIN_FREE_BLOCK_RECOVERY",
@@ -356,13 +358,27 @@ def test_constants():
           "timeout da resposta cabe no intervalo de polling")
     check(CFG["TELEGRAM_DNS_TIMEOUT_MS"] < 3000,
           "DNS limitado (nao usa os 10 s fixos do connect)")
-    check(CFG["TELEGRAM_MIN_FREE_BLOCK"] >= 8192,
-          "bloco contiguo minimo protege a alocacao do TLS")
-    # O buraco deixado por uma sessao que morreu (campo: 8 976 B) fica abaixo do
-    # piso normal, mas acima da necessidade real (8 450 B). Sem o piso de
-    # emergencia o gate ficava fechado para sempre e o bot parava de responder.
-    check(CFG["TELEGRAM_MIN_FREE_BLOCK_RECOVERY"] >= 8576,
-          "piso de emergencia cobre a alocacao real da sessao")
+    # A sessao TLS persistente aloca, em sequencia, contexto do cliente (3 408 B)
+    # + buffer RX (4096+325) + buffer TX (512+85): derivado das constantes dos
+    # buffers, nao um numero magico.
+    session_bytes = (3408 + (CFG["TELEGRAM_TLS_RX_BUFFER"] + 325) +
+                     (CFG["TELEGRAM_TLS_TX_BUFFER"] + 85))
+    check(CFG["TELEGRAM_SESSION_BYTES"] == session_bytes == 8426,
+          "TELEGRAM_SESSION_BYTES = contexto + RX + TX (derivado dos buffers)")
+    check(CFG["TELEGRAM_SESSION_BYTES"] < CFG["TELEGRAM_SESSION_HOLE_BYTES"],
+          "a alocacao da sessao cabe no buraco que ela deixa ao ser fechada")
+    # TELEGRAM_SESSION_HOLE_BYTES e MEDICAO DE CAMPO (heap(pos-close) do log de
+    # 2026-11-20): refazer a medicao se os buffers da sessao mudarem.
+    check(CFG["TELEGRAM_SESSION_HOLE_BYTES"] >= 8192,
+          "buraco da sessao documentado como medicao de campo")
+    # Era o que faltava no campo: com o piso ACIMA do buraco, qualquer fechamento
+    # de sessao (falha ou renovacao) fechava o gate para sempre.
+    check(CFG["TELEGRAM_MIN_FREE_BLOCK"] < CFG["TELEGRAM_SESSION_HOLE_BYTES"],
+          "piso normal cabe no buraco deixado pela sessao fechada")
+    check(CFG["TELEGRAM_MIN_FREE_BLOCK"] >= CFG["TELEGRAM_SESSION_BYTES"] - 512,
+          "piso normal nao e menor que a alocacao da sessao")
+    check(CFG["TELEGRAM_MIN_FREE_BLOCK_RECOVERY"] < CFG["TELEGRAM_SESSION_HOLE_BYTES"],
+          "piso de emergencia tambem cabe no buraco da sessao")
     check(CFG["TELEGRAM_MIN_FREE_BLOCK_RECOVERY"] < CFG["TELEGRAM_MIN_FREE_BLOCK"],
           "piso de emergencia menor que o normal (so recria a sessao caida)")
     check(CFG["TELEGRAM_GATE_RECOVERY_PERIOD_MS"] >= CFG["TELEGRAM_POLL_INTERVAL_MS"],

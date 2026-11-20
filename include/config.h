@@ -375,29 +375,51 @@ constexpr int TELEGRAM_TLS_TX_BUFFER = 512;
 // (resposta maior e descartada como falha, sem truncar JSON).
 constexpr size_t TELEGRAM_BODY_MAX = 2048;
 
-// Maior bloco contiguo exigido para CRIAR a sessao TLS. Necessidade real medida
-// em 2026-11-19: o core aloca, em sequencia, contexto do cliente (3408 B) +
-// buffer RX (4421 B) + buffer TX (597 B) = 8 426 B (+ ~24 B de cabecalhos do
-// alocador). O validador X.509 (3064 B) vem de outro bloco, e por isso o gate de
-// heap LIVRE (abaixo) e igualmente obrigatorio. 9 216 B = 8 426 + ~790 de folga.
+// Bytes residentes da sessao TLS persistente: o core aloca, em sequencia,
+// contexto do cliente (3408 B) + buffer RX (4096+325) + buffer TX (512+85). E
+// tambem o tamanho do "buraco" que a sessao deixa no heap quando e fechada.
+// Derivado das constantes dos buffers: mexer no RX do Telegram quebra o
+// static_assert abaixo em vez de voltar silenciosamente para o campo.
+constexpr size_t TELEGRAM_SESSION_BYTES =
+    3408 + (TELEGRAM_TLS_RX_BUFFER + 325) + (TELEGRAM_TLS_TX_BUFFER + 85);
+
+// Buraco MEDIDO no heap quando a sessao foi fechada: os buffers da sessao mais o
+// alinhamento do cabecalho do alocador. Duas medicoes independentes em
+// 2026-11-20 (linha `TG: heap(pos-close) ... bloco=`): 8 496 B numa queda por
+// timeout do getUpdates e 8 472 B na renovacao preventiva do ensaio de bancada.
+// Fica o MENOR, porque e ele que o piso de bloco tem de caber (8 472 > 8 192
+// ainda com ~280 B de margem). Refazer a medicao se os buffers mudarem.
+constexpr size_t TELEGRAM_SESSION_HOLE_BYTES = 8472;
+
+// Maior bloco contiguo exigido para CRIAR a sessao TLS (primeira consulta do
+// boot, quando o heap ainda esta inteiro). O validador X.509 (3064 B) vem de
+// outro bloco, e por isso o gate de heap LIVRE (abaixo) e igualmente
+// obrigatorio.
+//
+// ATENCAO: os DOIS pisos de bloco tem de ficar ABAIXO de
+// TELEGRAM_SESSION_HOLE_BYTES. Em 2026-11-20 o par antigo (9 216 normal / 8 704
+// emergencia) ficou ACIMA do buraco medido de 8 496 B: qualquer fechamento de
+// sessao - uma lentidao de getUpdates (3 s) ou a renovacao preventiva dos 50 min,
+// que fecha a sessao ANTES de o gate medir o heap - deixava o gate fechado PARA
+// SEMPRE (`tg=adiado(8496B)` por ~30 min, dois alertas presos na fila, ate a
+// guarda reiniciar como ultimo recurso).
+//
 // Observacao de campo: com o MQTT conectado o bloco fica em ~14,2 KB; com o
 // broker fora do ar fica em ~10 KB (por isso nao se usa 12 288 aqui).
-constexpr size_t TELEGRAM_MIN_FREE_BLOCK = 9216;
+constexpr size_t TELEGRAM_MIN_FREE_BLOCK = 8192;  // ~300 B abaixo do buraco
 
 // Piso de EMERGENCIA do maior bloco contiguo, usado APENAS para recriar uma
-// sessao que acabou de morrer (ver TELEGRAM_GATE_RECOVERY_PERIOD_MS). O piso
-// normal acima protege a PRIMEIRA sessao, quando o heap ainda esta inteiro.
+// sessao que acabou de morrer (ver TELEGRAM_GATE_RECOVERY_PERIOD_MS, uma
+// tentativa por minuto). Com o piso normal ja ABAIXO do buraco da sessao, este e
+// a SEGUNDA chance, para heaps mais fragmentados: 6 144 B, ainda acima do maior
+// buffer da sessao (RX de 4 421 B) e da alocacao sem o alinhamento.
 //
-// Quando a sessao cai (queda do socket, erro de HTTP ou simplesmente o servidor
-// fechando a conexao ociosa), o bloco que ela ocupava volta para o heap como um
-// buraco do tamanho exato da sessao. Medido em campo em 2026-11-20: buraco de
-// 8 976 B com 14 656 B livres - ou seja, 240 B ABAIXO do piso normal e 550 B
-// ACIMA da necessidade real (8 426 B de alocacao + ~24 B de cabecalhos). Sem
-// este piso o gate (que so vale quando a sessao precisa ser CRIADA) ficava
-// fechado para sempre: o log repetia `tg=adiado(8976B)` por horas e /help e
-// /status nunca eram respondidos, embora o resto do firmware continuasse
-// publicando. 8 704 B = 8 426 + ~278 B de folga.
-constexpr size_t TELEGRAM_MIN_FREE_BLOCK_RECOVERY = 8704;
+// Historico: a versao anterior (8 704 B) tentava cobrir a alocacao real num
+// buraco medido de 8 976 B. Quando o layout mudou (RX do MQTT de 4096 para 3072
+// e a sessao do Telegram criada ANTES da do MQTT) o buraco passou a 8 496 B e
+// este piso ficou 208 B ACIMA dele: nunca mais disparava e o gate ficava fechado
+// para sempre depois de qualquer queda de sessao.
+constexpr size_t TELEGRAM_MIN_FREE_BLOCK_RECOVERY = 6144;
 
 // Menor heap LIVRE TOTAL aceito para tentar uma consulta. O maior bloco sozinho
 // NAO basta: medido em 2026-11-19, o handshake consumia 9792 B (contexto do
@@ -599,13 +621,23 @@ static_assert(TELEGRAM_BODY_MAX <= 4096, "corpo HTTP maximo acima do razoavel");
 // O piso de heap livre tem de cobrir o pico do handshake (bloco + validacao).
 static_assert(TELEGRAM_MIN_FREE_HEAP > TELEGRAM_MIN_FREE_BLOCK,
               "TELEGRAM_MIN_FREE_HEAP deve ser maior que o bloco minimo");
+// Regra de ouro: a alocacao da sessao e os DOIS pisos de bloco cabem no buraco
+// que ela deixa ao ser fechada. Era exatamente isso que faltava em 2026-11-20
+// (pisos 9 216/8 704 acima do buraco de 8 496 B -> gate fechado para sempre).
+static_assert(TELEGRAM_SESSION_BYTES < TELEGRAM_SESSION_HOLE_BYTES,
+              "a alocacao da sessao deve caber no buraco que ela deixa");
+static_assert(TELEGRAM_MIN_FREE_BLOCK < TELEGRAM_SESSION_HOLE_BYTES,
+              "o piso normal deve caber no buraco deixado pela sessao");
+static_assert(TELEGRAM_MIN_FREE_BLOCK >= TELEGRAM_SESSION_BYTES - 512,
+              "o piso normal nao pode ser menor que a alocacao da sessao");
 // O piso de emergencia so pode ser MENOR que o normal: ele existe para o buraco
 // deixado pela sessao anterior caber na recriacao, nunca para afrouxar o gate.
 static_assert(TELEGRAM_MIN_FREE_BLOCK_RECOVERY < TELEGRAM_MIN_FREE_BLOCK,
               "o piso de emergencia deve ser menor que o piso normal");
-// Cobre 8 426 B de alocacao + cabecalhos do alocador (medido: 8 450 B).
-static_assert(TELEGRAM_MIN_FREE_BLOCK_RECOVERY >= 8576,
-              "o piso de emergencia deve cobrir a alocacao real da sessao");
+static_assert(TELEGRAM_MIN_FREE_BLOCK_RECOVERY < TELEGRAM_SESSION_HOLE_BYTES,
+              "o piso de emergencia tambem deve caber no buraco da sessao");
+static_assert(TELEGRAM_MIN_FREE_BLOCK_RECOVERY >= 4096,
+              "o piso de emergencia deve cobrir o maior buffer da sessao");
 // Uma recuperacao por loop seria um handshake por iteracao.
 static_assert(TELEGRAM_GATE_RECOVERY_PERIOD_MS >= TELEGRAM_POLL_INTERVAL_MS,
               "a recuperacao nao pode ser mais frequente que o polling");
