@@ -1,20 +1,12 @@
 #include "volume.h"
 
 // ============================================================================
-//  Constantes do programa original. Nao alterar sem recalibrar o sensor.
+//  Implementacao
+//
+//  As constantes de calibracao vivem em volume.h (constexpr) e sao compartilhadas
+//  com include/alerts.h e include/config.h. Aqui fica apenas a aplicacao da
+//  cadeia, na mesma ordem do programa original.
 // ============================================================================
-namespace {
-
-constexpr float kAdcReferenceV      = 3.3f;    // tensao de referencia do ADC
-constexpr float kAdcMaxCounts       = 1023.0f; // resolucao de 10 bits
-constexpr float kSensorFullScaleV   = 1.1f;    // fundo de escala do QDY30A
-constexpr float kSensorFullScaleMm  = 1000.0f; // 1,1 V equivalem a 1000 mm
-constexpr float kLevelOffsetMm      = 50.0f;   // offset de montagem
-constexpr float kLevelCorrection    = 1.05f;   // correcao de linearidade
-constexpr float kLitersPerMm        = 41.52f;  // geometria do reservatorio
-
-}  // namespace
-
 namespace volume {
 
 Measurement compute(uint16_t adc) {
@@ -28,13 +20,10 @@ Measurement compute(uint16_t adc) {
   result.sensorMm = result.voltageV / kSensorFullScaleV * kSensorFullScaleMm;
 
   // nivel = (leitura - 50) / 1.05, limitado a zero
-  result.levelMm = (result.sensorMm - kLevelOffsetMm) / kLevelCorrection;
-  if (result.levelMm < 0.0f) {
-    result.levelMm = 0.0f;
-  }
+  result.levelMm = levelMmFromSensorMm(result.sensorMm);
 
   // volume = nivel * 41.52
-  result.liters = result.levelMm * kLitersPerMm;
+  result.liters = litersForLevelMm(result.levelMm);
 
   return result;
 }

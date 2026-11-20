@@ -9,6 +9,8 @@
 
 #include <Arduino.h>
 
+#include "volume.h"
+
 // ---------------------------------------------------------------------------
 //  Modo de teste - a UNICA chave de selecao de ambiente
 //
@@ -55,10 +57,15 @@ constexpr bool BUTTON_USE_INTERNAL_PULLUP = false;
 //  Temporizacao (todo o controle e feito com millis(), sem delay())
 // ---------------------------------------------------------------------------
 constexpr uint32_t SAMPLE_INTERVAL_MS     = 250;    // aquisicao do sensor
-constexpr uint32_t DISPLAY_REFRESH_MS     = 4000;   // atualizacao do display
+constexpr uint32_t DISPLAY_REFRESH_MS     = 15000;  // atualizacao do display
 constexpr uint32_t DISPLAY_ON_TIME_MS     = 28000;  // desligamento automatico
 constexpr uint32_t DIAGNOSTIC_INTERVAL_MS = 5000;   // periodicidade do Serial
 constexpr uint32_t BUTTON_DEBOUNCE_MS     = 30;     // debounce do botao
+
+// A atualizacao precisa caber na janela em que o display esta ligado: um refresh
+// maior que o tempo ligado deixaria o valor congelado na tela.
+static_assert(DISPLAY_REFRESH_MS < DISPLAY_ON_TIME_MS,
+              "o intervalo de atualizacao do display deve caber no tempo ligado");
 
 // ---------------------------------------------------------------------------
 //  Filtro e display
@@ -94,10 +101,10 @@ enum class SimScenario : uint8_t {
 };
 
 // Cenario ativo. Troque aqui para testar os demais comportamentos.
-constexpr SimScenario SIM_SCENARIO = SimScenario::FILLING;
+constexpr SimScenario SIM_SCENARIO = SimScenario::DRAINING;
 
 constexpr bool  SIM_NOISE     = true;   // ruido artificial nas amostras ADC
-constexpr float SIM_TIME_SCALE = 20.0f; // 20x mais rapido que o tempo real
+constexpr float SIM_TIME_SCALE = 1.0f; // 1x: rampas de 120 s reais
 
 constexpr uint32_t SIM_SCENARIO_DURATION_MS = 120000; // rampas/recuperacao
 constexpr float    SIM_NOISE_AMPLITUDE_COUNTS = 3.0f; // +/- 3 contagens ADC
@@ -438,17 +445,65 @@ static_assert(TELEGRAM_SESSION_MAX_AGE_MS < 3600000UL,
               "o servidor fecha a sessao com ~1 h: renovar antes disso");
 
 // ---------------------------------------------------------------------------
+//  Alertas de nivel (Telegram)
+//
+//  O firmware compara o volume FILTRADO (o mesmo do display, do MQTT e do
+//  /status) com dois limiares e envia UMA mensagem por transicao:
+//    volume <= lr                  -> "atingiu o nivel de risco"
+//    volume <= lc                  -> "atingiu o nivel critico"
+//    subiu para >= lc + hist       -> "recuperou-se do nivel critico"
+//    subiu para >= lr + hist       -> "recuperou-se do nivel de risco"
+//
+//  Os limiares sao PERCENTUAIS DO MAIOR VOLUME MEDIVEL (fundo de escala do
+//  sensor): 100% = volume::maxMeasurableLiters() = 116.651 L (nivel corrigido de
+//  2.809,5 mm). Usa-se o teto do sensor, e nao os 3 m de agua do reservatorio,
+//  porque o ADC satura em 3,0 V - ou seja, 3 m de agua NAO seriam medidos e um
+//  limiar acima de 93,65% nunca dispararia.
+//
+//  Quando o nivel maximo real for identificado em producao, basta ajustar a
+//  calibracao em include/volume.h (as constantes sao a fonte unica deste numero).
+// ---------------------------------------------------------------------------
+constexpr uint8_t ALERT_DEFAULT_RISK_PCT     = 60;
+constexpr uint8_t ALERT_DEFAULT_CRITICAL_PCT = 30;
+constexpr uint8_t ALERT_DEFAULT_HIST_PCT     = 5;
+
+// Tempo entre o boot e a PRIMEIRA avaliacao: da tempo de sair do ruido da
+// primeira amostra e de o filtro encher (MOVING_AVERAGE_WINDOW amostras).
+constexpr uint32_t ALERT_SETTLE_MS = 15000UL;
+
+// Arquivo de configuracao/estado dos alertas: dois slots A/B (mesmo padrao do
+// historico). Nada aqui formata o LittleFS: se a montagem falhar, os alertas
+// funcionam em RAM com os defaults e o /w avisa que nao houve persistencia.
+constexpr char ALERT_FILE_A[] = "/w-alerts-a.dat";
+constexpr char ALERT_FILE_B[] = "/w-alerts-b.dat";
+
+static_assert(volume::maxMeasurableLiters() > 116000.0f &&
+                  volume::maxMeasurableLiters() < 117000.0f,
+              "a referencia dos alertas deve ser o teto do sensor (116.651 L)");
+static_assert(ALERT_DEFAULT_CRITICAL_PCT < ALERT_DEFAULT_RISK_PCT,
+              "o limiar critico deve ser menor que o de risco");
+static_assert(ALERT_DEFAULT_RISK_PCT + ALERT_DEFAULT_HIST_PCT <= 100,
+              "risco + histerese nao pode passar de 100% (nunca recuperaria)");
+static_assert(ALERT_SETTLE_MS >= MOVING_AVERAGE_WINDOW * SAMPLE_INTERVAL_MS,
+              "o settle deve cobrir o filtro cheio (janela x intervalo)");
+// ---------------------------------------------------------------------------
 //  Guarda de bloqueio - reboot controlado
 //
 //  Os dois servicos externos podem ficar bloqueados SEM prazo: o Telegram quando
 //  o gate de heap nao abre (fragmentacao) e o MQTT quando o broker/TLS nao aceita
-//  a sessao. Nenhum dos dois tem prazo que reabra o caminho sozinho (o gate e
-//  reavaliado a cada loop() e o MQTT ja usa backoff ate MQTT_MAX_RECONNECT_MS).
-//  O reboot devolve o heap inteiro e refaz as sessoes TLS do zero.
+//  a sessao. O reboot devolve o heap inteiro e refaz as sessoes TLS do zero.
+//
+//  ULTIMO RECURSO: o reboot NAO e um evento periodico. Ele exige as DUAS
+//  condicoes ao mesmo tempo: (1) um servico bloqueado ha TELEGRAM_STALL_REBOOT_MS
+//  / MQTT_STALL_REBOOT_MS e (2) o heap fragmentado a ponto de nao dar mais para
+//  recriar a sessao TLS - maior bloco contiguo abaixo de STALL_GUARD_MAX_BLOCK_FLOOR
+//  por STALL_GUARD_FRAGMENTED_MS. Um servico parado com o heap intacto NAO
+//  reinicia: o MQTT se recupera no backoff e o Telegram tem o piso de emergencia
+//  do gate (o caso real de campo era o heap preso abaixo do piso).
 //
 //  Regras: so conta com Wi-Fi conectado e fora da carencia do boot; nao conta
 //  quando as credenciais estao pendentes (nao ha o que reconectar); avisa uma vez
-//  ao passar de STALL_GUARD_FIRST_WARN_MS e reinicia ao atingir o limite.
+//  ao passar de STALL_GUARD_FIRST_WARN_MS (servico) e ao persistir a fragmentacao.
 //
 //  Custo de um reboot: uptime volta a zero, o historico do dia perde o acumulado
 //  desde o ultimo snapshot (ate HIST_SNAPSHOT_INTERVAL_MS) e a fila offline e
@@ -458,6 +513,14 @@ constexpr uint32_t STALL_GUARD_GRACE_MS = 60000UL;  // 1 min apos o boot
 constexpr uint32_t STALL_GUARD_FIRST_WARN_MS = 600000UL;  // 10 min: primeiro aviso
 constexpr uint32_t TELEGRAM_STALL_REBOOT_MS = 1800000UL;  // 30 min sem consulta ok
 constexpr uint32_t MQTT_STALL_REBOOT_MS = 1800000UL;      // 30 min sem sessao
+
+// Piso do maior bloco contiguo que AUTORIZA o reboot. Abaixo dele nem a
+// recuperacao consegue recriar a sessao TLS (TELEGRAM_MIN_FREE_BLOCK_RECOVERY):
+// e o estado "nao mais administravel" em que o reboot passa a valer a pena.
+constexpr size_t STALL_GUARD_MAX_BLOCK_FLOOR = TELEGRAM_MIN_FREE_BLOCK_RECOVERY;
+// Quanto tempo o bloco tem de ficar abaixo do piso para o reboot ser permitido.
+// O bloco oscila durante publicacao/handshake; so um estado SUSTENTADO conta.
+constexpr uint32_t STALL_GUARD_FRAGMENTED_MS = 300000UL;  // 5 min
 
 static_assert(STALL_GUARD_GRACE_MS >= TELEGRAM_POLL_INTERVAL_MS,
               "a carencia deve cobrir pelo menos um intervalo de polling");
@@ -471,6 +534,14 @@ static_assert(MQTT_STALL_REBOOT_MS > MQTT_MAX_RECONNECT_MS,
               "o backoff do MQTT deve ter chance antes do reboot");
 static_assert(TELEGRAM_STALL_REBOOT_MS <= 7200000UL && MQTT_STALL_REBOOT_MS <= 7200000UL,
               "bloqueio de mais de 2 h nao deve esperar o reboot");
+// O piso do reboot nao pode afrouxar a criacao da sessao: ele representa o
+// estado em que a recriacao ja falhou.
+static_assert(STALL_GUARD_MAX_BLOCK_FLOOR >= TELEGRAM_MIN_FREE_BLOCK_RECOVERY,
+              "o piso do reboot deve cobrir a recriacao da sessao TLS");
+// Exige persistencia: o gate de emergencia tenta uma vez por minuto e a
+// oscilacao do bloco nao pode disparar o reboot.
+static_assert(STALL_GUARD_FRAGMENTED_MS >= TELEGRAM_GATE_RECOVERY_PERIOD_MS,
+              "a fragmentacao precisa persistir alem da recuperacao do gate");
 
 // DIAGNOSTICO - instante da amostra de heap depois que a consulta termina
 // (sessao TLS ja destruida). Da tempo para o lwIP devolver os pbufs e para o

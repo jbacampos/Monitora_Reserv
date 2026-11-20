@@ -92,20 +92,51 @@ o firmware mudar sem que o verificador acompanhe.
 python check_telegram.py
 ```
 
-Cobre: classificacao de comandos (maiusculas, espacos, comandos inexistentes e
-**rejeicao de qualquer texto com `@`**, mesmo enderecado a outro bot), uptime
-acumulado (continuo na passagem pelo rollover de `millis()` e acima de 49,7
-dias, com formatacao em minutos/horas/dias), texto exato de `/help` e `/status`
-(7 grupos, `Sem dados`, nenhuma informacao interna), tamanho/URL-encoding do
-POST, `setInsecure()` ausente do codigo, CA validada nos dois transportes TLS,
-buffers do MQTT preservados (3072/512, com fallback automatico para 4096
-quando o broker envia um registro TLS maior que o buffer), credenciais apenas em
-`include/secrets.h`, SHA-256 da ancora Go Daddy G2, uso de `dayReport()` /
-`closedPeriodReport()` sem recalcular agregados e ausencia de `getMe`/username.
+Cobre: classificacao de comandos (`/help`/`/h`, `/status`/`/s`, `/warnings`/`/w`,
+maiusculas, espacos, comandos inexistentes e **rejeicao de qualquer texto com
+`@`**, mesmo enderecado a outro bot), uptime acumulado (continuo na passagem pelo
+rollover de `millis()` e acima de 49,7 dias, com formatacao em minutos/horas/dias),
+texto exato do aviso de boot (`MoniRes reiniciado.`, acentuado) e do `/help` e
+`/status` (7 grupos, `Sem dados`, nenhuma informacao interna, litros com
+separador de milhar), tamanho/URL-encoding do POST, `setInsecure()` ausente do
+codigo, CA validada nos dois transportes TLS, buffers do MQTT preservados
+(3072/512, com fallback automatico para 4096 quando o broker envia um registro TLS
+maior que o buffer), credenciais apenas em `include/secrets.h`, SHA-256 da ancora
+Go Daddy G2, uso de `dayReport()` / `closedPeriodReport()` sem recalcular agregados
+e ausencia de `getMe`/username.
 Cobre tambem a sessao TLS persistente: liberacao da sessao com socket morto
 ANTES da medicao de heap, renovacao preventiva aos 50 min (o servidor fecha a
 conexao com ~1 h) e a guarda de bloqueio que reinicia o ESP quando Telegram ou
 MQTT ficam presos por tempo demais.
+E, na secao 19, os **alertas de nivel**: referencia dos percentuais (teto do
+sensor, 116.651 L), `/w` sem argumento e `/w lr lc hist`, validacao dos limites
+(ordem e histerese), as quatro transicoes com histerese de um lado so, transicoes
+em cadeia, o texto exato das quatro mensagens e a ligacao com o Telegram (uma
+mensagem por consulta, antes do `getUpdates`, com `peek`/`confirm`).
+
+## `check_alerts.py` — verificador dos alertas de nivel (persistencia)
+
+Valida o que sustenta a preservacao de dados do `/w` **sem device**: le o layout
+real de `include/alerts.h` (falha se o C++ mudar sem o verificador acompanhar),
+reproduz o registro byte a byte e simula o LittleFS, incluindo **reboots**.
+
+```sh
+python check_alerts.py
+```
+
+Cobre: layout de 32 B (magic `WCFG`, versao, limites, estado, 2 pendentes com
+tipo + volume float32, geracao e CRC32 sobre os 28 primeiros bytes), recusa de
+registro corrompido (CRC, magic, versao, estado ou limites incoerentes), dois
+slots A/B com geracao crescente e escolha do mais novo no boot, gravacao que
+falha sem sobrescrever o slot bom, **pendente que sobrevive ao reboot e e
+reentregue sem duplicar** (e sem reenviar depois de confirmado), recuperacao com
+histerese preservando o estado, transicoes em cadeia, fila cheia descartando o
+alerta mais antigo, settle antes da primeira avaliacao, ausencia de LittleFS (opera
+em RAM e volta aos defaults no reboot) e limites invalidos que nao gravam nada.
+
+Limite: nao executa o C++. O comportamento do `src/alert_monitor.cpp` e confirmado
+pela compilacao do PlatformIO e pelos espelhos acima; a confirmacao em hardware
+exige `pio run -t upload` e observar as mensagens no chat de TESTE.
 
 ## Cobertura
 
@@ -119,6 +150,7 @@ MQTT ficam presos por tempo demais.
 | fila offline (`check_queue.py`) | layout binario lido do header C++, CRC32, header/footer, reboot com 344 registros em 3 segmentos, ordem cronologica, memoria cheia, corrupcao em quarentena, cauda parcial, retentativa sem duplicar |
 | historico diario (`check_history.py`) | layout 1600/52 B lido do header C++, slots vazio/corrompido/valido, `count` divergente, dia civil BRT, rotacao do anel de 30 dias, A/B por geracao, cobertura por dia e por periodo, 24 h simuladas (287 snapshots), reboot pelo snapshot, dia pendente e bit degradado, limiar de espaco |
 | periodos fechados (`check_history.py`) | `closedPeriodReport()`: janela de 7/30 dias terminando em ontem, exclusao integral de hoje, virada de meia-noite BRT, dias faltantes, dias parciais/reiniciados/com lacuna, extremos globais, media ponderada pelo numero de amostras, historico insuficiente, recusa acima do anel/0 dias/sem relogio e `periodReport()` identica ao codigo congelado em 15 combinacoes |
-| Telegram (`check_telegram.py`) | constantes lidas de `config.h`, classificacao de comandos (`/help`, `/status`, maiusculas, espacos, `/status@Bot` e qualquer texto com `@` **rejeitados**, `/reboot` e `/ota` inexistentes, texto vazio/absurdo), uptime acumulado (antes, durante e depois do rollover de `millis()`, acumulado acima de 49,7 dias, formatacao em minutos/horas/dias), texto exato de `/help` e `/status` (7 grupos, `Sem dados`, sem media/Wi-Fi/MQTT), tamanho e URL-encoding do POST, ausencia de `setInsecure()`, CA validada nos dois transportes, buffers do MQTT preservados, credenciais fora dos arquivos versionados, SHA-256 da ancora TLS, uso de `dayReport()`/`closedPeriodReport()` sem recalcular agregados, piso de emergencia que recria a sessao TLS caida (o gate nao trava para sempre), liberacao da sessao TLS morta antes da medicao de heap, renovacao preventiva aos 50 min (o servidor fecha a conexao com ~1 h), RX do MQTT reduzido a 3072 B, `FIRMWARE_VERSION` unica, integracao no `loop()` e ausencia de `getMe`/username |
-| guarda de bloqueio (`check_telegram.py`, secao 18) | reboot so com Wi-Fi conectado, carencia do boot, aviso unico antes do reboot, credenciais pendentes nao contam como bloqueio, limites lidos de `config.h` (TG/MQTT), **carimbo no futuro conta como silencio zero** (o poll do Telegram bloqueia e marca `millis()` depois do `now` do loop), rollover de `millis()`, nenhuma alocacao dinamica e ligacao no `loop()` |
+| Telegram (`check_telegram.py`) | constantes lidas de `config.h`, classificacao de comandos (`/help`/`/h`, `/status`/`/s`, maiusculas, espacos, `/status@Bot` e qualquer texto com `@` **rejeitados**, `/reboot` e `/ota` inexistentes, texto vazio/absurdo), uptime acumulado (antes, durante e depois do rollover de `millis()`, acumulado acima de 49,7 dias, formatacao em minutos/horas/dias), texto exato do aviso de boot (`MoniRes reiniciado.`) e de `/help` e `/status` (7 grupos, `Sem dados`, sem media/Wi-Fi/MQTT, abreviacoes anunciadas), tamanho e URL-encoding do POST, ausencia de `setInsecure()`, CA validada nos dois transportes, buffers do MQTT preservados, credenciais fora dos arquivos versionados, SHA-256 da ancora TLS, uso de `dayReport()`/`closedPeriodReport()` sem recalcular agregados, piso de emergencia que recria a sessao TLS caida (o gate nao trava para sempre), liberacao da sessao TLS morta antes da medicao de heap, renovacao preventiva aos 50 min (o servidor fecha a conexao com ~1 h), RX do MQTT reduzido a 3072 B, `FIRMWARE_VERSION` unica, integracao no `loop()` e ausencia de `getMe`/username |
+| guarda de bloqueio (`check_telegram.py`, secao 18) | reboot so com Wi-Fi conectado, carencia do boot, aviso unico antes do reboot, credenciais pendentes nao contam como bloqueio, limites lidos de `config.h` (TG/MQTT), **sessao MQTT de pe conta como viva** (uma conexao longa e saudavel nao reinicia a cada 30 min), **reboot so com o heap inadministravel** (maior bloco contiguo abaixo do piso de emergencia por tempo sustentado; servico bloqueado com heap intacto nao reinicia), **carimbo no futuro conta como silencio zero** (o poll do Telegram bloqueia e marca `millis()` depois do `now` do loop), rollover de `millis()`, nenhuma alocacao dinamica e ligacao no `loop()` |
+| alertas de nivel (`check_telegram.py`, secao 19 + `check_alerts.py`) | `/w`/`/warnings` (mostrar e configurar `lr lc hist`), percentuais do teto do sensor (116.651 L), validacao de ordem e histerese, as quatro transicoes com histerese de um lado so (entrada no limiar, recuperacao em limiar + hist), degrau direto emitindo so o alerta critico, transicoes em cadeia, texto exato das quatro mensagens, registro de 32 B com CRC32 e dois slots A/B (geracao escolhe o mais novo), gravacao que falha sem perder o slot bom, **reboot sem alerta duplicado e com o pendente reentregue**, fila de 2 pendentes descartando o mais antigo, settle de 15 s, ausencia de LittleFS e limites invalidos que nao gravam |
 | fallback de TLS do MQTT (`check_telegram.py`, secao 10) | RX normal de 3072 B, RX de emergencia de 4096 B maior que o normal e dentro do limite do core, `BR_ERR_TOO_LARGE` (codigo 6) amplia o buffer, falta de heap (-1000) volta ao normal, tentativa que falhou libera contexto/buffers (`PubSubClient` nao chama `stop()` em falha de handshake), nova tentativa sem o backoff dobrado, TLS so com o relogio sincronizado e hora passada ao BearSSL (`setX509Time`) nos dois transportes |

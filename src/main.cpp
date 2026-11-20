@@ -1,5 +1,6 @@
 #include <Arduino.h>
 
+#include "alert_monitor.h"
 #include "clock.h"
 #include "config.h"
 #include "credentials.h"
@@ -34,6 +35,7 @@ WiFiManager g_wifi;
 ThingsBoard g_tb;
 History g_history;
 Telegram g_telegram;
+AlertMonitor g_alerts;
 
 // Uptime acumulado (imune ao rollover de millis()) e a ultima medicao.
 UptimeCounter g_uptime;
@@ -109,12 +111,17 @@ void printDiagnostics(uint32_t nowMs) {
                 static_cast<unsigned>(ESP.getFreeHeap()),
                 static_cast<unsigned>(ESP.getMaxFreeBlockSize()), tgState);
 
+  // Alertas de nivel: estado e quantos ainda esperam envio. Sem isso, um alerta
+  // parado na fila (heap fechado) ficaria invisivel no log.
+  Serial.printf(" | alertas=%s(%u)", g_alerts.levelText(),
+                static_cast<unsigned>(g_alerts.pendingCount()));
+
   Serial.println();
 }
 
 void printStartup() {
   Serial.println();
-  Serial.println(F("=== Monitora_Reserv - Etapa 2 ==="));
+  Serial.println(F("=== MoniRes - Etapa 2 ==="));
   Serial.printf("Modo: %s\n", TEST_MODE ? "TESTE (simulador + credenciais de teste)"
                                         : "PRODUCAO (analogRead A0 + credenciais de producao)");
 
@@ -145,6 +152,16 @@ void printStartup() {
                 static_cast<unsigned long>(HIST_SNAPSHOT_INTERVAL_MS / 60000UL),
                 static_cast<unsigned long>(HIST_SAMPLE_INTERVAL_MS / 1000UL));
 
+  // Alertas: os defaults ficam em config.h; os limites EFETIVOS podem ter sido
+  // trocados por /w e sao carregados do LittleFS em g_alerts.begin().
+  Serial.printf("Alertas: risco %u%% | critico %u%% | histerese %u%% | "
+                "ref. 100%% = %lu L | settle %lu s\n",
+                static_cast<unsigned>(ALERT_DEFAULT_RISK_PCT),
+                static_cast<unsigned>(ALERT_DEFAULT_CRITICAL_PCT),
+                static_cast<unsigned>(ALERT_DEFAULT_HIST_PCT),
+                static_cast<unsigned long>(volume::maxMeasurableLiters() + 0.5f),
+                static_cast<unsigned long>(ALERT_SETTLE_MS / 1000UL));
+
   Serial.printf(
       "Guarda: TG %lu min | MQTT %lu min | aviso %lu min | carencia %lu s | "
       "renovacao TG %lu min\n",
@@ -174,6 +191,9 @@ void setup() {
 
   // Historico depois do ThingsBoard: reutiliza o LittleFS ja montado pela fila.
   g_history.begin(now);
+
+  // Alertas de nivel: mesmos LittleFS e mesmo volume filtrado do resto.
+  g_alerts.begin(now);
 
   // Telegram: apenas estado (nenhuma conexao no setup). A primeira consulta a
   // Bot API acontece TELEGRAM_POLL_INTERVAL_MS depois do boot.
@@ -228,6 +248,10 @@ void loop() {
   g_history.update(now, device_clock::synced(), g_lastSampleTimestampMs,
                    g_filteredLiters, g_hasSample);
 
+  // Alertas de nivel: avalia o volume FILTRADO e enfileira no maximo um evento
+  // por passo. Vem ANTES do Telegram para o alerta sair na mesma consulta.
+  g_alerts.update(now, g_filteredLiters, g_hasSample);
+
   // Telegram: primeira consulta a Bot API TELEGRAM_POLL_INTERVAL_MS depois do
   // boot. Recebe o MESMO volume enviado ao ThingsBoard, o uptime acumulado
   // (imune ao rollover de millis()) e o historico (unica fonte dos agregados).
@@ -237,6 +261,7 @@ void loop() {
   telegramContext.uptimeS = g_uptime.seconds();
   telegramContext.sampleValid = g_hasSample;
   telegramContext.history = &g_history;
+  telegramContext.alerts = &g_alerts;
   g_telegram.update(now, telegramContext);
 
   // Diagnostico em frequencia propria, independente da aquisicao.
@@ -247,13 +272,20 @@ void loop() {
 
   // Guarda de bloqueio: Telegram ou MQTT sem sucesso por tempo demais nao se
   // recuperam sozinhos (heap fragmentado / broker recusando a sessao). O reboot
-  // e a ultima saida e devolve o heap inteiro. Sem Wi-Fi, nada e contado.
+  // e a ULTIMA saida - so com um servico bloqueado E o heap fragmentado sem
+  // volta - e devolve o heap inteiro. Sem Wi-Fi, nada e contado.
   stall_guard::Input guardInput;
   guardInput.wifiConnected = g_wifi.connected();
   guardInput.telegramEnabled = g_telegram.enabled();
   guardInput.mqttEnabled = !tbTokenPending();
   guardInput.telegramLastOkMs = g_telegram.lastSuccessMs();
-  guardInput.mqttLastOkMs = g_tb.lastConnectedMs();
+  // Sessao MQTT de pe conta como viva (o PubSubClient derruba o socket quando ela
+  // morre): sem isso uma conexao longa e saudavel, que nunca reconecta, parecia
+  // "parada" e reiniciava o ESP a cada 30 min. Sem sessao, o silencio e medido
+  // desde o ultimo aceite ou a ultima publicacao confirmada.
+  guardInput.mqttLastOkMs = g_tb.connected() ? millis() : g_tb.lastActivityMs();
+  // Maior bloco contiguo para o criterio de fragmentacao inadministravel.
+  guardInput.maxFreeBlockBytes = ESP.getMaxFreeBlockSize();
   // Carimbo NOVO: os modulos acima podem ter bloqueado (a consulta do Telegram
   // segura ~1,4 s) e marcar millis() maior que o `now` do inicio do loop. Com o
   // `now` defasado a conta do silencio ficava negativa e a guarda reiniciava o

@@ -10,15 +10,15 @@
 //  unica fonte do texto humano, usada pelo aviso de boot do Telegram e pelo log
 //  serial. Nada mais no projeto repete essas descricoes.
 //
-//   1  Power On               "Energizacao (power-on)"
+//   1  Power On               "Energização"
 //   2  Hardware Watchdog      "Watchdog de hardware"
-//   3  Exception              "Excecao de software"
+//   3  Exception              "Exceção de software"
 //   4  Software Watchdog      "Watchdog de software"
-//   5  Software/System reset  "Reinicio (/reboot)"
-//   6  Deep-Sleep Wake        "Despertar de deep sleep"
+//   5  Software/System reset  "Reinício (/reboot)"
+//   6  Deep-Sleep Wake        "Retorno de deep sleep"
 //   7  External System        "Reset externo"
 //   8  Unknown                "Desconhecido"
-//   9  OTA                    "Atualizacao OTA (/ota)"
+//   9  OTA                    "Atualização OTA (/ota)"
 //
 //  Sem Arduino e sem alocacao: testavel no host (tools/host_test).
 // ============================================================================
@@ -41,21 +41,21 @@ enum BootReason : uint8_t {
 inline const char *bootReasonDescription(uint8_t code) {
   switch (code) {
     case BOOT_REASON_POWER_ON:
-      return "Energizacao";
+      return "Energização";
     case BOOT_REASON_HARDWARE_WATCHDOG:
       return "Watchdog de hardware";
     case BOOT_REASON_EXCEPTION:
-      return "Excecao de software";
+      return "Exceção de software";
     case BOOT_REASON_SOFTWARE_WATCHDOG:
       return "Watchdog de software";
     case BOOT_REASON_SOFTWARE_RESTART:
-      return "Reinicio (/reboot)";
+      return "Reinício (/reboot)";
     case BOOT_REASON_DEEP_SLEEP:
       return "Retorno de deep sleep";
     case BOOT_REASON_EXTERNAL_SYSTEM:
       return "Reset externo";
     case BOOT_REASON_OTA:
-      return "Atualizacao OTA (/ota)";
+      return "Atualização OTA (/ota)";
     case BOOT_REASON_UNKNOWN:
     default:
       return "Desconhecido";

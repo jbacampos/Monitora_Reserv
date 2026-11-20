@@ -4,11 +4,13 @@
 
 O firmware conversa com a Bot API diretamente no ESP8266. A parte testavel sem
 hardware e a camada de texto (include/telegram_text.h): classificacao de comandos
-e construcao das mensagens de /help e /status. Este script:
+e construcao das mensagens de /help, /status e /warnings (com as abreviacoes /h,
+/s e /w) e os alertas de nivel. Este script:
 
-  1. LE as constantes reais de include/config.h (intervalo de polling, buffers
-     TLS, corpo HTTP, versao) e falha se os valores mudarem sem que o
-     verificador acompanhe;
+  1. LE as constantes reais de include/config.h e a calibracao de
+     include/volume.h (intervalo de polling, buffers TLS, corpo HTTP, versao,
+     referencia dos alertas) e falha se os valores mudarem sem que o verificador
+     acompanhe;
   2. reproduz campo a campo as mensagens, comparando com o texto EXATO enviado
      (inclusive a ausencia de /reboot e /ota);
   3. simula o UptimeCounter de include/uptime.h, inclusive a passagem pelo
@@ -19,7 +21,11 @@ e construcao das mensagens de /help e /status. Este script:
      reais apenas em include/secrets.h e a impressao digital da ancora TLS do
      Telegram igual ao SHA-256 documentado;
   6. confere que o /status usa dayReport() e closedPeriodReport() e NAO
-     recalcula agregados.
+     recalcula agregados;
+  7. na secao 19, espelha a maquina de estados dos alertas de nivel
+     (include/alerts.h): /w mostrar/configurar, validacao dos limites, histerese
+     de um lado so, transicoes em cadeia, texto exato das quatro mensagens e a
+     entrega pelo Telegram (uma por consulta, antes do getUpdates).
 
 Uso: python check_telegram.py
 """
@@ -39,6 +45,9 @@ TELEGRAM_CPP = os.path.join(ROOT, "src", "telegram.cpp")
 SECRETS = os.path.join(ROOT, "include", "secrets.h")
 SECRETS_EXAMPLE = os.path.join(ROOT, "include", "secrets.h.example")
 THINGSBOARD_CPP = os.path.join(ROOT, "src", "thingsboard.cpp")
+ALERTS_HEADER = os.path.join(ROOT, "include", "alerts.h")
+VOLUME_HEADER = os.path.join(ROOT, "include", "volume.h")
+ALERT_MONITOR_CPP = os.path.join(ROOT, "src", "alert_monitor.cpp")
 
 FAILURES = []
 
@@ -89,6 +98,8 @@ CFG = read_constants(
         "STALL_GUARD_FIRST_WARN_MS",
         "TELEGRAM_STALL_REBOOT_MS",
         "MQTT_STALL_REBOOT_MS",
+        "STALL_GUARD_MAX_BLOCK_FLOOR",
+        "STALL_GUARD_FRAGMENTED_MS",
         "TELEGRAM_HANDSHAKE_PEAK",
         "TELEGRAM_PEAK_HEADROOM",
         "TELEGRAM_MIN_FREE_HEAP",
@@ -98,8 +109,52 @@ CFG = read_constants(
         "MQTT_TLS_RX_BUFFER_FALLBACK",
         "MQTT_BUFFER_SIZE",
         "MQTT_MAX_RECONNECT_MS",
+        "MOVING_AVERAGE_WINDOW",
+        "SAMPLE_INTERVAL_MS",
+        "ALERT_DEFAULT_RISK_PCT",
+        "ALERT_DEFAULT_CRITICAL_PCT",
+        "ALERT_DEFAULT_HIST_PCT",
+        "ALERT_SETTLE_MS",
     ],
 )
+
+# Constantes de calibracao (float) de include/volume.h. read_constants() so
+# avalia inteiros/strings, e a referencia dos alertas depende de floats.
+def read_float_constants(path, names):
+    with open(path, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    values = {}
+    for name in names:
+        match = re.search(r"\b" + name + r"\s*=\s*([^;]+);", text)
+        if not match:
+            raise RuntimeError("constante %s nao encontrada em %s" % (name, path))
+        expression = match.group(1).replace("f", "").strip()
+        values[name] = float(eval(expression, {"__builtins__": {}}, values))
+    return values
+
+
+VOL = read_float_constants(
+    VOLUME_HEADER,
+    [
+        "kAdcReferenceV",
+        "kAdcMaxCounts",
+        "kSensorFullScaleV",
+        "kSensorFullScaleMm",
+        "kLevelOffsetMm",
+        "kLevelCorrection",
+        "kLitersPerMm",
+    ],
+)
+
+
+def mirrors_calibration():
+    """Espelho de volume.h: sensor -> nivel -> litros."""
+    sensor_mm = VOL["kSensorFullScaleMm"] * (VOL["kAdcReferenceV"] / VOL["kSensorFullScaleV"])
+    level_mm = (sensor_mm - VOL["kLevelOffsetMm"]) / VOL["kLevelCorrection"]
+    return level_mm, level_mm * VOL["kLitersPerMm"]
+
+
+MAX_LEVEL_MM, MAX_LITERS = mirrors_calibration()
 
 with open(TEXT_HEADER, "r", encoding="utf-8") as _handle:
     _text_header = _handle.read()
@@ -146,10 +201,20 @@ def parse_tg_command(text):
         normalized.append(char.lower())
     joined = "".join(normalized)
 
-    if joined == "/help":
-        return "Help", joined
-    if joined == "/status":
-        return "Status", joined
+    token = joined
+    arguments = ""
+    for index, char in enumerate(joined):
+        if char in " \t\r\n":
+            token = joined[:index]
+            arguments = joined[index:].strip(" \t\r\n")
+            break
+
+    if token in ("/help", "/h"):
+        return ("Help" if not arguments else "None"), joined
+    if token in ("/status", "/s"):
+        return ("Status" if not arguments else "None"), joined
+    if token in ("/w", "/warnings"):
+        return "Warnings", joined
     return "None", joined
 
 
@@ -164,9 +229,26 @@ def format_uptime(uptime_s):
     return "%dm" % minutes
 
 
+def format_grouped(value):
+    """Espelho de formatGroupedLong: separador de milhar por ponto."""
+    digits = str(abs(int(value)))
+    grouped = ""
+    for index, char in enumerate(digits):
+        remaining = len(digits) - index
+        grouped += char
+        if remaining > 1 and (remaining - 1) % 3 == 0:
+            grouped += "."
+    return ("-" if value < 0 else "") + grouped
+
+
 def format_liters(liters):
     value = int(liters + 0.5) if liters >= 0 else int(liters - 0.5)
-    return "%d L" % value
+    return "%s L" % format_grouped(value)
+
+
+def format_liters_bare(liters):
+    value = int(liters + 0.5) if liters >= 0 else int(liters - 0.5)
+    return format_grouped(value)
 
 
 def format_min_max(has_data, minimum, maximum):
@@ -174,18 +256,18 @@ def format_min_max(has_data, minimum, maximum):
         return "Sem dados"
     low = int(minimum + 0.5) if minimum >= 0 else int(minimum - 0.5)
     high = int(maximum + 0.5) if maximum >= 0 else int(maximum - 0.5)
-    return "min %d L | max %d L" % (low, high)
+    return "min %s L | max %s L" % (format_grouped(low), format_grouped(high))
 
 
 def build_status_message(data, version, uptime_s):
     volume = format_liters(data["volume_l"]) if data["has_volume"] else "Sem dados"
     return (
-        "Reservatorio\n"
+        "Reservatório\n"
         "Volume atual: %s\n"
         "Hoje: %s\n"
         "Ontem: %s\n"
-        "Ultimos 7 dias: %s\n"
-        "Ultimos 30 dias: %s\n"
+        "Últimos 7 dias: %s\n"
+        "Últimos 30 dias: %s\n"
         "Firmware: %s\n"
         "Uptime: %s"
         % (
@@ -202,9 +284,10 @@ def build_status_message(data, version, uptime_s):
 
 
 HELP_MESSAGE = (
-    "Comandos disponiveis:\n"
-    "/help - lista de comandos disponiveis\n"
-    "/status - situacao atual do reservatorio"
+    "Comandos disponíveis:\n"
+    "/help ou /h - lista de comandos disponíveis\n"
+    "/status ou /s - situação atual do reservatório\n"
+    "/warnings ou /w - limites e alertas de nível"
 )
 
 
@@ -305,6 +388,11 @@ def test_constants():
     check(CFG["TELEGRAM_STALL_REBOOT_MS"] <= 7200000 and
           CFG["MQTT_STALL_REBOOT_MS"] <= 7200000,
           "nenhum bloqueio espera mais de 2 h pelo reboot")
+    # Reboot = ULTIMO RECURSO: exige servico bloqueado E heap inadministravel.
+    check(CFG["STALL_GUARD_MAX_BLOCK_FLOOR"] >= CFG["TELEGRAM_MIN_FREE_BLOCK_RECOVERY"],
+          "piso do reboot cobre a recriacao da sessao TLS (heap inadministravel)")
+    check(CFG["STALL_GUARD_FRAGMENTED_MS"] >= CFG["TELEGRAM_GATE_RECOVERY_PERIOD_MS"],
+          "fragmentacao precisa persistir alem da recuperacao do gate")
     # O pico do handshake (~12,9 KB com RX=5120) deixava < 2 KB livres para o
     # lwIP/WiFi e o firmware morreu em memcpy(NULL) no contexto sys. O piso de
     # heap LIVRE TOTAL e o que impede repetir isso.
@@ -332,13 +420,29 @@ def test_commands():
     cases = [
         ("/help", "Help"),
         ("/status", "Status"),
+        ("/h", "Help"),
+        ("/s", "Status"),
         ("/HELP", "Help"),
         ("/Status", "Status"),
+        ("/H", "Help"),
+        ("/S", "Status"),
         ("  /status  ", "Status"),
         ("\r\n/help\r\n", "Help"),
+        ("\r\n/h\r\n", "Help"),
+        ("  /s  ", "Status"),
         ("/status agora", "None"),
         ("/statusx", "None"),
-        ("/s", "None"),
+        ("/help extra", "None"),
+        ("/hx", "None"),
+        ("/sx", "None"),
+        ("/w", "Warnings"),
+        ("/warnings", "Warnings"),
+        ("/W", "Warnings"),
+        ("/WARNINGS", "Warnings"),
+        ("/w 60 30 5", "Warnings"),
+        ("/warnings 60 30 5", "Warnings"),
+        ("/wx", "None"),
+        ("/warningsx", "None"),
         ("status", "None"),
         ("", "None"),
         ("   ", "None"),
@@ -362,6 +466,10 @@ def test_commands():
         "/status@OutroBot",
         "/status@",
         "/help@",
+        "/h@MoniResBot",
+        "/s@MoniResBot",
+        "/h@",
+        "/s@",
         "/status@moniresbot",
         "/STATUS@MoniResBot",
         "  /status@MoniResBot  ",
@@ -506,25 +614,30 @@ def test_uptime():
 
 def test_help():
     print("\n5. Mensagem do /help")
-    check(HELP_MESSAGE.splitlines()[0] == "Comandos disponiveis:",
+    check(HELP_MESSAGE.splitlines()[0] == "Comandos disponíveis:",
           "cabecalho correto")
     check("/reboot" not in HELP_MESSAGE, "/reboot NAO e anunciado")
     check("/ota" not in HELP_MESSAGE, "/ota NAO e anunciado")
-    check(HELP_MESSAGE.count("/help") == 1 and HELP_MESSAGE.count("/status") == 1,
-          "somente /help e /status listados")
+    check(HELP_MESSAGE.count("/help") == 1 and HELP_MESSAGE.count("/status") == 1 and
+          HELP_MESSAGE.count("/warnings") == 1,
+          "somente /help, /status e /warnings listados")
+    check("/h" in HELP_MESSAGE.splitlines()[1] and "/s" in HELP_MESSAGE.splitlines()[2],
+          "as abreviacoes /h e /s sao anunciadas junto dos comandos")
+    check("/warnings ou /w" in HELP_MESSAGE.splitlines()[3],
+          "o /w e anunciado com a abreviacao")
     check(len(HELP_MESSAGE) < TG_MESSAGE_MAX, "cabe no buffer de mensagem")
 
 
 BOOT_REASON_TEXT = {
-    1: "Energizacao",
+    1: "Energização",
     2: "Watchdog de hardware",
-    3: "Excecao de software",
+    3: "Exceção de software",
     4: "Watchdog de software",
-    5: "Reinicio (/reboot)",
+    5: "Reinício (/reboot)",
     6: "Retorno de deep sleep",
     7: "Reset externo",
     8: "Desconhecido",
-    9: "Atualizacao OTA (/ota)",
+    9: "Atualização OTA (/ota)",
 }
 
 BOOT_SDK_STRINGS = (
@@ -565,7 +678,7 @@ def classify_boot_reason(ota_marker, reset_reason):
 
 
 def build_boot_message(reason_code, version):
-    return "Monitora_Reserv reiniciado.\nVersao: %s\nMotivo: %s" % (
+    return "MoniRes reiniciado.\nVersão: %s\nMotivo: %s" % (
         version, BOOT_REASON_TEXT[reason_code])
 
 
@@ -580,14 +693,14 @@ def test_boot_notice():
     message = build_boot_message(1, "1.0.0")
     lines = message.split("\n")
     check(len(lines) == 3, "aviso tem exatamente 3 linhas (%d)" % len(lines))
-    check(lines[0] == "Monitora_Reserv reiniciado.", "1a linha: '<firmware> reiniciado.'")
-    check(lines[1] == "Versao: 1.0.0", "2a linha: versao do firmware")
-    check(lines[2] == "Motivo: Energizacao", "3a linha: motivo do boot")
+    check(lines[0] == "MoniRes reiniciado.", "1a linha: '<firmware> reiniciado.'")
+    check(lines[1] == "Versão: 1.0.0", "2a linha: versao do firmware")
+    check(lines[2] == "Motivo: Energização", "3a linha: motivo do boot")
     check(len(message) < TG_MESSAGE_MAX, "cabe no buffer de mensagem (%d B)"
           % len(message))
-    check('"Monitora_Reserv reiniciado.\\n"' in text_header,
+    check('"MoniRes reiniciado.\\n"' in text_header,
           "texto do aviso vive em include/telegram_text.h")
-    check('"Versao: %s\\n"' in text_header and '"Motivo: %s"' in text_header,
+    check('"Versão: %s\\n"' in text_header and '"Motivo: %s"' in text_header,
           "buildBootMessage usa versao e motivo")
 
     # 2) Tabela unica codigo -> descricao (nenhuma copia em outro arquivo).
@@ -636,13 +749,13 @@ def test_status():
     print("\n6. Mensagem do /status (grupos e ordem)")
     message = build_status_message(full_status_data(), "1.0.0", 2 * 3600 + 15 * 60)
     lines = message.split("\n")
-    check(lines[0] == "Reservatorio", "1o grupo: titulo")
-    check(lines[1] == "Volume atual: 1234 L", "2o grupo: volume atual em litros")
-    check(lines[2] == "Hoje: min 1200 L | max 1310 L", "3o grupo: hoje (min/max)")
-    check(lines[3] == "Ontem: min 1150 L | max 1290 L", "4o grupo: ontem (min/max)")
-    check(lines[4] == "Ultimos 7 dias: min 1100 L | max 1320 L",
+    check(lines[0] == "Reservatório", "1o grupo: titulo")
+    check(lines[1] == "Volume atual: 1.234 L", "2o grupo: volume atual em litros")
+    check(lines[2] == "Hoje: min 1.200 L | max 1.310 L", "3o grupo: hoje (min/max)")
+    check(lines[3] == "Ontem: min 1.150 L | max 1.290 L", "4o grupo: ontem (min/max)")
+    check(lines[4] == "Últimos 7 dias: min 1.100 L | max 1.320 L",
           "5o grupo: ultimos 7 dias completos")
-    check(lines[5] == "Ultimos 30 dias: min 980 L | max 1330 L",
+    check(lines[5] == "Últimos 30 dias: min 980 L | max 1.330 L",
           "6o grupo: ultimos 30 dias completos")
     check(lines[6] == "Firmware: 1.0.0", "7o grupo: versao do firmware")
     check(lines[7] == "Uptime: 2h 15m", "8o grupo: uptime")
@@ -671,8 +784,8 @@ def test_status():
     check("Volume atual: 830 L" in partial, "volume arredondado para litros")
     check("Hoje: min 801 L | max 830 L" in partial, "hoje com dados parciais")
     check("Ontem: Sem dados" in partial, "ontem sem dados")
-    check("Ultimos 7 dias: Sem dados" in partial, "7 dias sem dados")
-    check("Ultimos 30 dias: Sem dados" in partial, "30 dias sem dados")
+    check("Últimos 7 dias: Sem dados" in partial, "7 dias sem dados")
+    check("Últimos 30 dias: Sem dados" in partial, "30 dias sem dados")
     check("Uptime: 1d 1h 1m" in partial, "uptime em dias, horas e minutos")
 
     print("\n9. Tamanho e codificacao para o POST")
@@ -875,6 +988,16 @@ def test_invariants():
           "historico unico passado ao Telegram")
     check("telegramContext.volumeL = g_filteredLiters" in main_cpp,
           "volume atual vem da mesma fonte do ThingsBoard")
+    check("telegramContext.alerts = &g_alerts" in main_cpp,
+          "monitor de alertas passado ao Telegram")
+    check("g_alerts.begin(now)" in main_cpp, "alertas inicializados no setup")
+    check("g_alerts.update(now, g_filteredLiters, g_hasSample)" in main_cpp,
+          "alertas avaliados no loop com o volume filtrado")
+    # A ordem importa: o evento precisa estar na fila ANTES da consulta.
+    alerts_at = main_cpp.find("g_alerts.update(now, g_filteredLiters, g_hasSample)")
+    telegram_at = main_cpp.find("g_telegram.update(now, telegramContext)")
+    check(alerts_at != -1 and telegram_at != -1 and alerts_at < telegram_at,
+          "alertas avaliados ANTES da consulta do Telegram")
 
     print("\n15. Uptime acumulado (imune ao rollover de millis())")
     uptime_code = strip_comments(read_text(os.path.join(ROOT, "include", "uptime.h")))
@@ -906,8 +1029,10 @@ def test_invariants():
     text_header_code = strip_comments(read_text(TEXT_HEADER))
     check("*p == '@'" in text_header_code,
           "parseTgCommand recusa qualquer texto com '@'")
-    check("/help" in text_header_code and "/status" in text_header_code,
-          "apenas /help e /status sao reconhecidos")
+    check('"/help"' in text_header_code and '"/status"' in text_header_code and
+          '"/w"' in text_header_code and '"/warnings"' in text_header_code and
+          '"/h"' in text_header_code and '"/s"' in text_header_code,
+          "comandos reconhecidos: /help, /status e /warnings (com abreviacoes)")
 
     print("\n17. Comparacoes do leitor HTTP (os dois lados sem caixa)")
     tg_code = strip_comments(telegram)
@@ -939,6 +1064,13 @@ def test_invariants():
           "limites lidos de config.h para os dois servicos")
     check("new " not in guard_code and "String" not in guard_code,
           "guarda nao aloca (apenas contadores em .bss)")
+    check("STALL_GUARD_MAX_BLOCK_FLOOR" in guard_code and
+          "STALL_GUARD_FRAGMENTED_MS" in guard_code,
+          "reboot so com o heap fragmentado abaixo do piso por tempo sustentado")
+    check("input.maxFreeBlockBytes" in guard_code,
+          "a guarda le o maior bloco contiguo do Input")
+    check("if (!serviceStuck || !fragSustained)" in guard_code,
+          "reboot exige servico bloqueado E fragmentacao sustentada")
 
     telegram_header = read_text(os.path.join(ROOT, "include", "telegram.h"))
     check("uint32_t lastSuccessMs() const" in telegram_header,
@@ -946,10 +1078,12 @@ def test_invariants():
     check("m_lastSuccessMs = millis();" in telegram,
           "sucesso do getUpdates alimenta a guarda")
     board_header = read_text(os.path.join(ROOT, "include", "thingsboard.h"))
-    check("uint32_t lastConnectedMs() const" in board_header,
-          "ThingsBoard expoe a ultima sessao aceita")
-    check("m_lastConnectedMs = nowMs;" in thingsboard,
-          "conexao MQTT aceita alimenta a guarda")
+    check("uint32_t lastConnectedMs() const" in board_header and
+          "uint32_t lastActivityMs() const" in board_header,
+          "ThingsBoard expoe a ultima sessao e o ultimo sinal de vida")
+    check("m_lastConnectedMs = nowMs;" in thingsboard and
+          "m_lastPublishMs = nowMs;" in thingsboard,
+          "aceite de sessao e publicacao confirmada alimentam a guarda")
     check("stall_guard::begin(now)" in main_cpp, "guarda iniciada no setup")
     # Carimbo novo: a consulta do Telegram bloqueia ~1,4 s e marca millis()
     # maior que o `now` do inicio do loop; usar o `now` defasado fazia a conta
@@ -960,12 +1094,46 @@ def test_invariants():
     check("static_cast<int32_t>(delta) < 0" in guard_code,
           "carimbo no futuro conta como silencio zero (nao reinicia)")
     check("guardInput.telegramLastOkMs = g_telegram.lastSuccessMs()" in main_cpp and
-          "guardInput.mqttLastOkMs = g_tb.lastConnectedMs()" in main_cpp,
-          "loop passa os dois instantes de sucesso")
+          "g_tb.connected() ? millis() : g_tb.lastActivityMs()" in main_cpp,
+          "loop passa o sinal de vida: sessao MQTT de pe conta como viva")
+    check("guardInput.maxFreeBlockBytes = ESP.getMaxFreeBlockSize()" in main_cpp,
+          "loop passa o maior bloco contiguo (criterio de fragmentacao)")
     check("guardInput.mqttEnabled = !tbTokenPending()" in main_cpp,
           "token pendente desliga a contagem do MQTT")
     check("guardInput.telegramEnabled = g_telegram.enabled()" in main_cpp,
           "Telegram desativado nao conta como bloqueio")
+
+    # Reboot = ULTIMO RECURSO: a decisao exige as DUAS condicoes. Espelhada aqui
+    # porque o modulo depende de Arduino.
+    print("  reboot: servico bloqueado x fragmentacao inadministravel")
+
+    def reboot_allowed(service_stuck, frag_sustained):
+        return service_stuck and frag_sustained
+
+    reboot_cases = [
+        (False, False, False, "tudo ok: sem reboot"),
+        (True, False, False, "servico bloqueado, heap intacto: sem reboot"),
+        (False, True, False, "heap inadministravel, servico ok: sem reboot"),
+        (True, True, True, "servico bloqueado E heap inadministravel: reboot"),
+    ]
+    for stuck, frag, expected, label in reboot_cases:
+        check(reboot_allowed(stuck, frag) is expected, label)
+
+    # Fragmentacao transitoria (bloco abaixo do piso por menos de
+    # STALL_GUARD_FRAGMENTED_MS) nao conta: o bloco oscila durante a publicacao
+    # e o handshake.
+    frag_floor = CFG["STALL_GUARD_MAX_BLOCK_FLOOR"]
+    frag_window = CFG["STALL_GUARD_FRAGMENTED_MS"]
+
+    def frag_sustained(block, elapsed_ms):
+        return block < frag_floor and elapsed_ms >= frag_window
+
+    check(frag_sustained(frag_floor - 1, frag_window) is True,
+          "bloco abaixo do piso pelo tempo cheio: sustenta o reboot")
+    check(frag_sustained(frag_floor - 1, frag_window - 1) is False,
+          "bloco abaixo do piso por pouco tempo: vale transitorio nao conta")
+    check(frag_sustained(frag_floor, frag_window) is False,
+          "bloco no piso ou acima: heap administravel, sem reboot")
 
     # A conta do silencio e espelhada aqui porque o modulo depende de Arduino.
     # O caso de campo (2026-11-20) esta na lista: o poll do Telegram marcou
@@ -1042,6 +1210,272 @@ def test_http_helpers():
               % (haystack, token, expected))
 
 
+# ---------------------------------------------------------------------------
+#  Alertas de nivel (include/alerts.h) - espelhos puros
+# ---------------------------------------------------------------------------
+def alert_pct_liters(pct):
+    """Percentual do MAIOR volume medivel (100% = teto do sensor)."""
+    return MAX_LITERS * (pct / 100.0)
+
+
+def alert_enter_risk(cfg):
+    return alert_pct_liters(cfg["risk"])
+
+
+def alert_enter_critical(cfg):
+    return alert_pct_liters(cfg["critical"])
+
+
+def alert_recover_risk(cfg):
+    return alert_pct_liters(cfg["risk"] + cfg["hist"])
+
+
+def alert_recover_critical(cfg):
+    return alert_pct_liters(cfg["critical"] + cfg["hist"])
+
+
+def alert_validate(cfg):
+    """Espelho de alerts::validate(). Devolve o codigo do erro ou OK."""
+    if not 1 <= cfg["risk"] <= 100:
+        return "RISK_RANGE"
+    if not 1 <= cfg["critical"] <= 100:
+        return "CRITICAL_RANGE"
+    if not 1 <= cfg["hist"] <= 100:
+        return "HIST_RANGE"
+    if cfg["critical"] >= cfg["risk"]:
+        return "ORDER"
+    if cfg["risk"] + cfg["hist"] > 100:
+        return "HIST_OVERFLOW"
+    return "OK"
+
+
+def alert_step(level, cfg, volume):
+    """Espelho de alerts::step(): UMA transicao por chamada -> (evento, estado)."""
+    if level == "CRITICAL":
+        if volume >= alert_recover_critical(cfg):
+            return "CRITICAL_RECOVERED", "RISK"
+        return "NONE", level
+    if level == "RISK":
+        if volume >= alert_recover_risk(cfg):
+            return "RISK_RECOVERED", "NORMAL"
+        if volume <= alert_enter_critical(cfg):
+            return "CRITICAL_ENTERED", "CRITICAL"
+        return "NONE", level
+    if volume <= alert_enter_critical(cfg):
+        return "CRITICAL_ENTERED", "CRITICAL"
+    if volume <= alert_enter_risk(cfg):
+        return "RISK_ENTERED", "RISK"
+    return "NONE", level
+
+
+def alert_level_for(cfg, volume):
+    """Espelho de alerts::levelFor(): estado sem emitir evento (rebaseline)."""
+    if volume <= alert_enter_critical(cfg):
+        return "CRITICAL"
+    if volume <= alert_enter_risk(cfg):
+        return "RISK"
+    return "NORMAL"
+
+
+def alert_drain(level, cfg, volume, limit):
+    """Espelho do laco de AlertMonitor::update() (no maximo `limit` eventos)."""
+    events = []
+    for _ in range(limit):
+        event, level = alert_step(level, cfg, volume)
+        if event == "NONE":
+            break
+        events.append(event)
+    return events, level
+
+
+def build_alert_message(event, volume):
+    liters = format_liters_bare(volume)
+    return {
+        "RISK_ENTERED":
+            "Alerta: reservatório atingiu o nível de risco - %s litros" % liters,
+        "CRITICAL_ENTERED":
+            "Alerta: reservatório atingiu o nível crítico - %s litros" % liters,
+        "CRITICAL_RECOVERED":
+            "Reservatório recuperou-se do nível crítico - %s litros" % liters,
+        "RISK_RECOVERED":
+            "Reservatório recuperou-se do nível de risco - %s litros" % liters,
+    }[event]
+
+
+def parse_warnings(args):
+    """Espelho de parseWarnings(): SHOW / SET / INVALID (+ config lida)."""
+    if args is None or args == "":
+        return "SHOW", None
+
+    parts = args.split()
+    if len(parts) != 3:
+        return "INVALID", None
+    for part in parts:
+        if not (part.isascii() and part.isdigit()):
+            return "INVALID", None
+
+    values = [int(part) for part in parts]
+    if any(value < 1 or value > 100 for value in values):
+        return "INVALID", None
+    return "SET", {"risk": values[0], "critical": values[1], "hist": values[2]}
+
+
+def test_alerts():
+    print("\n19. Alertas de nivel (/w e mensagens automaticas)")
+    alerts_header = read_text(ALERTS_HEADER)
+    monitor = strip_comments(read_text(ALERT_MONITOR_CPP))
+    text_header = strip_comments(read_text(TEXT_HEADER))
+    telegram = strip_comments(read_text(TELEGRAM_CPP))
+
+    cfg = {"risk": CFG["ALERT_DEFAULT_RISK_PCT"],
+           "critical": CFG["ALERT_DEFAULT_CRITICAL_PCT"],
+           "hist": CFG["ALERT_DEFAULT_HIST_PCT"]}
+
+    print("  19a. Referencia dos percentuais (teto do sensor)")
+    check(abs(MAX_LEVEL_MM - 2809.5) < 0.1,
+          "100%% = nivel maximo medivel (2.809,5 mm); obtido %.1f" % MAX_LEVEL_MM)
+    check(abs(MAX_LITERS - 116651.4) < 0.1,
+          "100%% = maior volume medivel (116.651 L); obtido %.1f" % MAX_LITERS)
+    check(alert_enter_risk(cfg) > alert_enter_critical(cfg),
+          "o risco fica acima do critico")
+    check(cfg["hist"] >= 1, "histerese minima de 1 ponto (evita oscilacao)")
+    check(CFG["ALERT_SETTLE_MS"] >=
+          CFG["MOVING_AVERAGE_WINDOW"] * CFG["SAMPLE_INTERVAL_MS"],
+          "settle cobre o filtro cheio (%u ms)" % CFG["ALERT_SETTLE_MS"])
+    check((CFG["ALERT_DEFAULT_RISK_PCT"], CFG["ALERT_DEFAULT_CRITICAL_PCT"],
+           CFG["ALERT_DEFAULT_HIST_PCT"]) == (60, 30, 5),
+          "defaults de fabrica: 60/30/5")
+
+    print("  19b. /w: mostrar e configurar")
+    check(parse_warnings("")[0] == "SHOW", "/w sozinho -> SHOW")
+    for args, expected in (("60 30 5", "SET"), ("100 99 1", "SET"),
+                           ("60 30", "INVALID"),
+                           ("60 30 5 1", "INVALID"), ("60x 30 5", "INVALID"),
+                           ("60 30 0", "INVALID"), ("60 30 101", "INVALID"),
+                           ("-60 30 5", "INVALID"), ("60.5 30 5", "INVALID")):
+        check(parse_warnings(args)[0] == expected,
+              "/w %r -> %s" % (args, expected))
+    # A coerencia entre os tres (ordem e histerese) NAO e do parser: e do
+    # alerts::validate(), para a mensagem de erro poder dizer o que esta errado.
+    check(parse_warnings("1 1 1")[0] == "SET" and
+          alert_validate(parse_warnings("1 1 1")[1]) == "ORDER",
+          "'1 1 1' passa no parser e e recusado por ORDER")
+    check(parse_warnings("7 3 2")[1] == {"risk": 7, "critical": 3, "hist": 2},
+          "valores lidos na ordem lr lc hist")
+
+    print("  19c. Validacao dos limites")
+    for candidate, expected in (({"risk": 60, "critical": 30, "hist": 5}, "OK"),
+                                ({"risk": 30, "critical": 30, "hist": 5}, "ORDER"),
+                                ({"risk": 20, "critical": 30, "hist": 5}, "ORDER"),
+                                ({"risk": 95, "critical": 30, "hist": 6}, "HIST_OVERFLOW"),
+                                ({"risk": 90, "critical": 30, "hist": 10}, "OK"),
+                                ({"risk": 0, "critical": 30, "hist": 5}, "RISK_RANGE"),
+                                ({"risk": 101, "critical": 30, "hist": 5}, "RISK_RANGE"),
+                                ({"risk": 60, "critical": 0, "hist": 5}, "CRITICAL_RANGE"),
+                                ({"risk": 60, "critical": 30, "hist": 0}, "HIST_RANGE")):
+        check(alert_validate(candidate) == expected,
+              "%r -> %s" % (candidate, expected))
+
+    print("  19d. Transicoes, histerese e transicoes em cadeia")
+    cases = [
+        ("NORMAL", 90000.0, "NONE", "NORMAL", "acima do risco: nada"),
+        ("NORMAL", 65000.0, "RISK_ENTERED", "RISK", "caiu abaixo do risco"),
+        ("NORMAL", 30000.0, "CRITICAL_ENTERED", "CRITICAL",
+         "degrau direto: so o alerta critico"),
+        ("RISK", 65000.0, "NONE", "RISK", "mesma faixa: sem evento"),
+        ("RISK", 74000.0, "NONE", "RISK",
+         "acima do risco mas abaixo de risco+hist: histerese segura"),
+        ("RISK", 76000.0, "RISK_RECOVERED", "NORMAL", "risco recuperado"),
+        ("RISK", 30000.0, "CRITICAL_ENTERED", "CRITICAL", "piorou para o critico"),
+        ("CRITICAL", 40000.0, "NONE", "CRITICAL",
+         "acima do critico mas abaixo de critico+hist"),
+        ("CRITICAL", 41000.0, "CRITICAL_RECOVERED", "RISK", "critico recuperado"),
+        ("NORMAL", 0.0, "CRITICAL_ENTERED", "CRITICAL", "volume nulo"),
+    ]
+    for level, volume, event, expected_level, label in cases:
+        result, result_level = alert_step(level, cfg, volume)
+        check(result == event and result_level == expected_level,
+              "%s %.0f L -> %s (%s)" % (level, volume, event, label))
+
+    check(alert_step("NORMAL", cfg, alert_enter_risk(cfg))[0] == "RISK_ENTERED",
+          "entrada exatamente NO limiar de risco")
+    check(alert_step("RISK", cfg, alert_enter_risk(cfg))[0] == "NONE",
+          "a mesma altura, ja em risco, nao recupera (histerese)")
+    check(alert_step("CRITICAL", cfg, alert_recover_critical(cfg))[0] ==
+          "CRITICAL_RECOVERED", "recuperacao exatamente no limiar + hist")
+
+    events, level = alert_drain("CRITICAL", cfg, 90000.0, 2)
+    check(events == ["CRITICAL_RECOVERED", "RISK_RECOVERED"] and level == "NORMAL",
+          "salto grande recupera do critico e do risco (2 mensagens)")
+
+    check(alert_level_for(cfg, 30000.0) == "CRITICAL" and
+          alert_level_for(cfg, 65000.0) == "RISK" and
+          alert_level_for(cfg, 90000.0) == "NORMAL",
+          "rebaseline do /w adota o estado atual, sem evento")
+
+    print("  19e. Texto exato das mensagens")
+    check(build_alert_message("RISK_ENTERED", 69990.0) ==
+          "Alerta: reservatório atingiu o nível de risco - 69.990 litros",
+          "alerta de risco")
+    check(build_alert_message("CRITICAL_ENTERED", 34995.0) ==
+          "Alerta: reservatório atingiu o nível crítico - 34.995 litros",
+          "alerta critico")
+    check(build_alert_message("CRITICAL_RECOVERED", 40828.0) ==
+          "Reservatório recuperou-se do nível crítico - 40.828 litros",
+          "recuperacao do critico")
+    check(build_alert_message("RISK_RECOVERED", 75823.0) ==
+          "Reservatório recuperou-se do nível de risco - 75.823 litros",
+          "recuperacao do risco")
+    check(build_alert_message("RISK_RECOVERED", 116651.0).endswith("116.651 litros"),
+          "separador de milhar no volume do alerta")
+    for event in ("RISK_ENTERED", "CRITICAL_ENTERED", "CRITICAL_RECOVERED",
+                  "RISK_RECOVERED"):
+        message = build_alert_message(event, 69990.0)
+        body = "chat_id=-1001234567890&text=" + url_encode(message)
+        check(len(message) < TG_MESSAGE_MAX and len(body) < FORM_CAPACITY,
+              "%s cabe na mensagem (%d B) e no POST (%d B)"
+              % (event, len(message), len(body)))
+
+    print("  19f. Persistencia e ligacao no Telegram")
+    check("constexpr size_t RECORD_SIZE = 32;" in alerts_header,
+          "registro de 32 B")
+    check("RECORD_MAGIC = 0x47464357UL" in alerts_header, "magic 'WCFG'")
+    check("MAX_PENDING = 2;" in alerts_header, "fila de 2 pendentes")
+    check("queue_record::crc32(out, 28)" in alerts_header and
+          "queue_record::get32(in + 28)" in alerts_header,
+          "CRC32 cobre os 28 primeiros bytes")
+    check("putFloat(out + 11" in alerts_header and "putFloat(out + 16" in alerts_header,
+          "volume de cada pendente como float32")
+    check("validate(parsed.config) != ConfigError::OK" in alerts_header,
+          "registro com limites invalidos e recusado")
+    check("ALERT_FILE_A" in monitor and "ALERT_FILE_B" in monitor,
+          "dois slots A/B no LittleFS")
+    check("m_state.generation + 1" in monitor and "m_activeSlot" in monitor,
+          "geracao crescente escolhe o slot mais novo")
+    check("ALERT_SETTLE_MS" in monitor, "settle antes da primeira avaliacao")
+    check("alerts::levelFor" in monitor, "rebaseline silencioso ao aplicar /w")
+    check("buildAlertMessage" in monitor and "alerts::popPending" in monitor,
+          "peek/confirm pelo modulo de alertas")
+    check("void Telegram::flushPendingAlerts(uint32_t nowMs, AlertMonitor *alerts)"
+          in telegram, "Telegram entrega os alertas pendentes")
+    check("alerts->confirmPending();" in telegram,
+          "confirmado so depois do envio bem-sucedido")
+    flush_at = telegram.find("flushPendingAlerts(nowMs, context.alerts);")
+    poll_at = telegram.find("pollOnce(nowMs, context);")
+    check(flush_at != -1 and poll_at != -1 and flush_at < poll_at,
+          "alerta sai ANTES da consulta (mesma sessao TLS)")
+    check("TgCommand::Warnings" in telegram, "answerCommand trata o /w")
+    check("parseWarnings(tgArgsOf(g_normalized), requested)" in telegram,
+          "argumentos vem do texto normalizado (puro)")
+    check(text_header.count("Reservatório recuperou-se do nível") == 2 and
+          text_header.count("reservatório atingiu o nível") == 2,
+          "as quatro mensagens vivem na camada de texto")
+    check("Limites atualizados." in text_header and "Uso: /w lr lc hist" in text_header,
+          "confirmacao e erro do /w com o uso")
+    check("o crítico deve ser menor que o risco" in text_header,
+          "erro de ordem explicado ao operador")
+
+
 def main():
     print("Telegram - verificacao de host")
     test_constants()
@@ -1051,6 +1485,7 @@ def main():
     test_boot_notice()
     test_status()
     test_http_helpers()
+    test_alerts()
     test_invariants()
 
     print()

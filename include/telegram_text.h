@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "alerts.h"
 #include "boot_reason.h"
 
 // ============================================================================
@@ -14,14 +15,19 @@
 //  a unica parte testavel sem hardware. O modulo src/telegram.cpp cuida de TLS,
 //  HTTP, JSON e das consultas ao historico; nada aqui conhece a rede.
 //
-//  Nesta etapa existem apenas /help e /status. /reboot e /ota NAO existem e nao
-//  sao anunciados. Comandos enderecados a um bot ("/status@QualquerBot") nao
-//  existem neste projeto: qualquer texto com '@' e recusado.
+//  Comandos: /help (/h), /status (/s) e /warnings (/w). /reboot e /ota NAO
+//  existem e nao sao anunciados. Comandos enderecados a um bot
+//  ("/status@QualquerBot") nao existem neste projeto: qualquer texto com '@' e
+//  recusado.
+//
+//  As mensagens usam acentuacao em UTF-8 (o urlEncodeInto() de src/telegram.cpp
+//  codifica byte a byte) e separador de milhar com ponto nos litros.
 // ============================================================================
 enum class TgCommand : uint8_t {
   None = 0,
   Help = 1,
   Status = 2,
+  Warnings = 3,
 };
 
 // Tamanho maximo de uma mensagem enviada (texto puro, antes do URL-encoding).
@@ -40,7 +46,26 @@ inline bool tgIsSpace(char c) {
 //   - RECUSA qualquer texto que contenha '@'. O MoniRes nao se endereca por
 //     username: "/status@MoniResBot", "/help@OutroBot" e qualquer variacao sao
 //     simplesmente ignorados, independentemente do nome informado.
-// Depois compara com os comandos desta etapa ("/help" e "/status", apenas).
+// Depois compara com o PRIMEIRO token: "/help"/"/h"/"/status"/"/s" (sem nada
+// depois) e "/w"/"/warnings" (com ou sem argumentos).
+inline bool tgMatchCommand(const char *normalized, const char *name) {
+  const size_t len = strlen(name);
+  return strncmp(normalized, name, len) == 0 &&
+         (normalized[len] == '\0' || tgIsSpace(normalized[len]));
+}
+
+// Argumentos de um comando que os aceita: aponta para dentro de `normalized`,
+// ja sem os separadores entre o comando e o primeiro argumento.
+inline const char *tgArgsOf(const char *normalized) {
+  while (*normalized != '\0' && !tgIsSpace(*normalized)) {
+    ++normalized;
+  }
+  while (*normalized != '\0' && tgIsSpace(*normalized)) {
+    ++normalized;
+  }
+  return normalized;
+}
+
 inline TgCommand parseTgCommand(const char *text, char *out, size_t outSize) {
   if (out == nullptr || outSize == 0) {
     return TgCommand::None;
@@ -80,13 +105,96 @@ inline TgCommand parseTgCommand(const char *text, char *out, size_t outSize) {
   }
   out[len] = '\0';
 
-  if (strcmp(out, "/help") == 0) {
-    return TgCommand::Help;
+  // O token e comparado por prefixo delimitado; o que vem depois fica em `out`
+  // para o parser de argumentos (apenas /w usa).
+  if (tgMatchCommand(out, "/help") || tgMatchCommand(out, "/h")) {
+    return tgArgsOf(out)[0] == '\0' ? TgCommand::Help : TgCommand::None;
   }
-  if (strcmp(out, "/status") == 0) {
-    return TgCommand::Status;
+  if (tgMatchCommand(out, "/status") || tgMatchCommand(out, "/s")) {
+    return tgArgsOf(out)[0] == '\0' ? TgCommand::Status : TgCommand::None;
+  }
+  if (tgMatchCommand(out, "/w") || tgMatchCommand(out, "/warnings")) {
+    return TgCommand::Warnings;
   }
   return TgCommand::None;
+}
+
+// ---------------------------------------------------------------------------
+//  Argumentos do /w
+// ---------------------------------------------------------------------------
+enum class WarningsParse : uint8_t {
+  SHOW = 0,     // "/w" sozinho: mostrar os limites
+  SET = 1,      // "/w lr lc hist": aplicar
+  INVALID = 2,  // quantidade/formato invalidos
+};
+
+// Le tres inteiros separados por espacos. Devolve false em qualquer caractere
+// fora de digito, argumento a mais ou valor fora de 1..100. A coerencia entre os
+// tres (ordem e histerese) fica em alerts::validate(), para a mensagem de erro
+// poder dizer exatamente o que esta errado.
+inline bool parseWarningsTriple(const char *args, uint8_t &riskPct,
+                                uint8_t &criticalPct, uint8_t &histPct) {
+  if (args == nullptr || args[0] == '\0') {
+    return false;
+  }
+
+  unsigned values[3] = {0, 0, 0};
+  int index = 0;
+
+  while (*args != '\0') {
+    while (tgIsSpace(*args)) {
+      ++args;
+    }
+    if (*args == '\0') {
+      break;
+    }
+    if (index >= 3 || *args < '0' || *args > '9') {
+      return false;
+    }
+
+    unsigned value = 0;
+    while (*args >= '0' && *args <= '9') {
+      value = value * 10u + static_cast<unsigned>(*args - '0');
+      if (value > 100u) {
+        return false;  // ja passou do maximo aceito
+      }
+      ++args;
+    }
+    if (*args != '\0' && !tgIsSpace(*args)) {
+      return false;  // "20x", "20.5", ...
+    }
+    values[index++] = value;
+  }
+
+  if (index != 3) {
+    return false;
+  }
+  if (values[0] == 0 || values[1] == 0 || values[2] == 0) {
+    return false;  // 0 nao e percentual valido
+  }
+
+  riskPct = static_cast<uint8_t>(values[0]);
+  criticalPct = static_cast<uint8_t>(values[1]);
+  histPct = static_cast<uint8_t>(values[2]);
+  return true;
+}
+
+inline WarningsParse parseWarnings(const char *args, alerts::Config &cfg) {
+  if (args == nullptr || args[0] == '\0') {
+    return WarningsParse::SHOW;
+  }
+
+  uint8_t riskPct = 0;
+  uint8_t criticalPct = 0;
+  uint8_t histPct = 0;
+  if (!parseWarningsTriple(args, riskPct, criticalPct, histPct)) {
+    return WarningsParse::INVALID;
+  }
+
+  cfg.riskPct = riskPct;
+  cfg.criticalPct = criticalPct;
+  cfg.histPct = histPct;
+  return WarningsParse::SET;
 }
 
 // ---------------------------------------------------------------------------
@@ -114,11 +222,51 @@ inline void formatUptime(uint32_t uptimeS, char *out, size_t outSize) {
   }
 }
 
-// Litros inteiros ("1234 L"). O volume do firmware e sempre >= 0.
+// Inteiro com separador de milhar por ponto ("830", "1.234", "116.651"). O ponto
+// e "seguro" no URL-encoding, portanto nao encarece o POST.
+inline void formatGroupedLong(long value, char *out, size_t outSize) {
+  char digits[16];
+  int count = 0;
+  const bool negative = value < 0;
+  unsigned long magnitude = negative ? static_cast<unsigned long>(-value)
+                                     : static_cast<unsigned long>(value);
+
+  do {
+    digits[count++] = static_cast<char>('0' + (magnitude % 10UL));
+    magnitude /= 10UL;
+  } while (magnitude != 0 && count < 15);
+
+  size_t written = 0;
+  if (negative && written + 1 < outSize) {
+    out[written++] = '-';
+  }
+  for (int i = count - 1; i >= 0; --i) {
+    if (written + 1 >= outSize) {
+      break;
+    }
+    out[written++] = digits[i];
+    if (i > 0 && (i % 3) == 0 && written + 1 < outSize) {
+      out[written++] = '.';
+    }
+  }
+  out[written] = '\0';
+}
+
+// Litros inteiros com separador de milhar ("1.234 L"). O volume e sempre >= 0.
 inline void formatLiters(float liters, char *out, size_t outSize) {
   const long value =
       static_cast<long>(liters < 0.0f ? liters - 0.5f : liters + 0.5f);
-  snprintf(out, outSize, "%ld L", value);
+
+  char grouped[12];  // "999.999.999" + NUL
+  formatGroupedLong(value, grouped, sizeof(grouped));
+  snprintf(out, outSize, "%s L", grouped);
+}
+
+// Litros inteiros SEM unidade ("1.234"), para frases que ja dizem "litros".
+inline void formatLitersBare(float liters, char *out, size_t outSize) {
+  const long value =
+      static_cast<long>(liters < 0.0f ? liters - 0.5f : liters + 0.5f);
+  formatGroupedLong(value, out, outSize);
 }
 
 // ---------------------------------------------------------------------------
@@ -147,7 +295,7 @@ struct TelegramStatusData {
   float last30MaxL = 0.0f;
 };
 
-// "min 1200 L | max 1310 L" ou "Sem dados".
+// "min 1.200 L | max 1.310 L" ou "Sem dados".
 inline void formatMinMax(bool hasData, float minL, float maxL, char *out,
                          size_t outSize) {
   if (!hasData) {
@@ -157,7 +305,12 @@ inline void formatMinMax(bool hasData, float minL, float maxL, char *out,
 
   const long low = static_cast<long>(minL < 0.0f ? minL - 0.5f : minL + 0.5f);
   const long high = static_cast<long>(maxL < 0.0f ? maxL - 0.5f : maxL + 0.5f);
-  snprintf(out, outSize, "min %ld L | max %ld L", low, high);
+
+  char lowText[12];
+  char highText[12];
+  formatGroupedLong(low, lowText, sizeof(lowText));
+  formatGroupedLong(high, highText, sizeof(highText));
+  snprintf(out, outSize, "min %s L | max %s L", lowText, highText);
 }
 
 // Mensagem do /status: os sete grupos pedidos, nesta ordem, e nada mais.
@@ -191,12 +344,12 @@ inline void buildStatusMessage(const TelegramStatusData &data,
   formatUptime(uptimeS, uptime, sizeof(uptime));
 
   snprintf(out, outSize,
-           "Reservatorio\n"
+           "Reservatório\n"
            "Volume atual: %s\n"
            "Hoje: %s\n"
            "Ontem: %s\n"
-           "Ultimos 7 dias: %s\n"
-           "Ultimos 30 dias: %s\n"
+           "Últimos 7 dias: %s\n"
+           "Últimos 30 dias: %s\n"
            "Firmware: %s\n"
            "Uptime: %s",
            volume, today, yesterday, last7, last30, version, uptime);
@@ -205,25 +358,172 @@ inline void buildStatusMessage(const TelegramStatusData &data,
 // Mensagem do /help: somente os comandos que existem nesta etapa.
 inline void buildHelpMessage(char *out, size_t outSize) {
   snprintf(out, outSize,
-           "Comandos disponiveis:\n"
-           "/help - lista de comandos disponiveis\n"
-           "/status - situacao atual do reservatorio");
+           "Comandos disponíveis:\n"
+           "/help ou /h - lista de comandos disponíveis\n"
+           "/status ou /s - situação atual do reservatório\n"
+           "/warnings ou /w - limites e alertas de nível");
 }
 
 // ---------------------------------------------------------------------------
 //  Aviso de boot
 // ---------------------------------------------------------------------------
 // Mesmo padrao visual e de conteudo do Monitora_DG: tres linhas, nada mais.
-//   Monitora_Reserv reiniciado.
-//   Versao: 1.0.0
-//   Motivo: Energizacao
-// Texto em ASCII (como todas as mensagens do MoniRes); o motivo vem da tabela
-// unica de include/boot_reason.h.
+//   MoniRes reiniciado.
+//   Versão: 1.0.0
+//   Motivo: Energização
+// O texto usa acentuacao (UTF-8) como todas as mensagens do MoniRes; o motivo
+// vem da tabela unica de include/boot_reason.h.
 inline void buildBootMessage(uint8_t bootReason, const char *version, char *out,
                              size_t outSize) {
   snprintf(out, outSize,
-           "Monitora_Reserv reiniciado.\n"
-           "Versao: %s\n"
+           "MoniRes reiniciado.\n"
+           "Versão: %s\n"
            "Motivo: %s",
            version, bootReasonDescription(bootReason));
+}
+
+// ---------------------------------------------------------------------------
+//  /warnings - limites
+// ---------------------------------------------------------------------------
+// Nome do estado do nivel ("Normal", "Risco", "Crítico").
+inline const char *alertLevelName(alerts::Level level) {
+  switch (level) {
+    case alerts::Level::RISK:
+      return "Risco";
+    case alerts::Level::CRITICAL:
+      return "Crítico";
+    case alerts::Level::NORMAL:
+    default:
+      return "Normal";
+  }
+}
+
+// Motivo, em portugues, de uma configuracao recusada.
+inline const char *warningsErrorText(alerts::ConfigError error) {
+  switch (error) {
+    case alerts::ConfigError::RISK_RANGE:
+      return "o risco deve ficar entre 1 e 100";
+    case alerts::ConfigError::CRITICAL_RANGE:
+      return "o crítico deve ficar entre 1 e 100";
+    case alerts::ConfigError::HIST_RANGE:
+      return "a histerese deve ficar entre 1 e 100";
+    case alerts::ConfigError::ORDER:
+      return "o crítico deve ser menor que o risco";
+    case alerts::ConfigError::HIST_OVERFLOW:
+      return "risco + histerese não pode passar de 100";
+    case alerts::ConfigError::OK:
+    default:
+      return "limites válidos";
+  }
+}
+
+// Bloco comum aos modos do /w: os limites vigentes (em % e em litros) e o
+// estado atual.
+inline void buildWarningsLimits(alerts::Config cfg, alerts::Level level,
+                                float volumeL, bool hasVolume, char *out,
+                                size_t outSize) {
+  char risk[24];
+  char critical[24];
+  formatGroupedLong(
+      static_cast<long>(alerts::enterRiskLiters(cfg) + 0.5f), risk,
+      sizeof(risk));
+  formatGroupedLong(
+      static_cast<long>(alerts::enterCriticalLiters(cfg) + 0.5f), critical,
+      sizeof(critical));
+
+  char state[64];
+  if (hasVolume) {
+    char current[24];
+    formatGroupedLong(static_cast<long>(volumeL + 0.5f), current,
+                      sizeof(current));
+    snprintf(state, sizeof(state), "%s - %s L", alertLevelName(level), current);
+  } else {
+    snprintf(state, sizeof(state), "%s (sem leitura)", alertLevelName(level));
+  }
+
+  snprintf(out, outSize,
+           "Risco: %u%% = %s L\n"
+           "Crítico: %u%% = %s L\n"
+           "Histerese: %u pontos\n"
+           "Estado atual: %s",
+           static_cast<unsigned>(cfg.riskPct), risk,
+           static_cast<unsigned>(cfg.criticalPct), critical,
+           static_cast<unsigned>(cfg.histPct), state);
+}
+
+// "/w" (sem argumentos): referencia, limites e estado atual.
+inline void buildWarningsMessage(alerts::Config cfg, alerts::Level level,
+                                 float volumeL, bool hasVolume, char *out,
+                                 size_t outSize) {
+  char limits[200];
+  buildWarningsLimits(cfg, level, volumeL, hasVolume, limits, sizeof(limits));
+
+  char reference[24];
+  formatGroupedLong(static_cast<long>(alerts::maxReferenceLiters() + 0.5f),
+                    reference, sizeof(reference));
+
+  snprintf(out, outSize,
+           "Alertas de nível\n"
+           "Referência (100%%): %s L\n"
+           "%s",
+           reference, limits);
+}
+
+// "/w lr lc hist" aceito.
+inline void buildWarningsAppliedMessage(alerts::Config cfg, alerts::Level level,
+                                        float volumeL, bool hasVolume, char *out,
+                                        size_t outSize) {
+  char limits[200];
+  buildWarningsLimits(cfg, level, volumeL, hasVolume, limits, sizeof(limits));
+
+  snprintf(out, outSize, "Limites atualizados.\n%s", limits);
+}
+
+// "/w ..." recusado: motivo + uso + limites vigentes (que NAO mudaram).
+inline void buildWarningsErrorMessage(const char *reason, alerts::Config cfg,
+                                      char *out, size_t outSize) {
+  snprintf(out, outSize,
+           "Limites não alterados: %s\n"
+           "Uso: /w lr lc hist (percentuais de 1 a 100)\n"
+           "Atuais: risco %u%%, crítico %u%%, histerese %u%%",
+           reason, static_cast<unsigned>(cfg.riskPct),
+           static_cast<unsigned>(cfg.criticalPct),
+           static_cast<unsigned>(cfg.histPct));
+}
+
+// ---------------------------------------------------------------------------
+//  Alertas enviados pelo firmware (nao sao resposta a comando)
+// ---------------------------------------------------------------------------
+// As quatro mensagens, sempre com o volume CAPTURADO no instante da transicao.
+inline void buildAlertMessage(alerts::Event event, float volumeL, char *out,
+                              size_t outSize) {
+  char liters[24];
+  formatLitersBare(volumeL, liters, sizeof(liters));
+
+  switch (event) {
+    case alerts::Event::RISK_ENTERED:
+      snprintf(out, outSize,
+               "Alerta: reservatório atingiu o nível de risco - %s litros",
+               liters);
+      break;
+    case alerts::Event::CRITICAL_ENTERED:
+      snprintf(out, outSize,
+               "Alerta: reservatório atingiu o nível crítico - %s litros",
+               liters);
+      break;
+    case alerts::Event::CRITICAL_RECOVERED:
+      snprintf(out, outSize,
+               "Reservatório recuperou-se do nível crítico - %s litros",
+               liters);
+      break;
+    case alerts::Event::RISK_RECOVERED:
+      snprintf(out, outSize,
+               "Reservatório recuperou-se do nível de risco - %s litros",
+               liters);
+      break;
+    case alerts::Event::NONE:
+    default:
+      out[0] = '\0';
+      break;
+  }
 }

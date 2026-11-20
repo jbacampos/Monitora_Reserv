@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 // ============================================================================
@@ -18,8 +19,11 @@
 //               O backoff chega a MQTT_MAX_RECONNECT_MS e fica repetindo para
 //               sempre, sem devolver o heap que a tentativa consumiu.
 //
-//  O reboot devolve o heap inteiro e refaz as sessoes TLS do zero. As regras
-//  temporais ficam em config.h (STALL_GUARD_*).
+//  O reboot devolve o heap inteiro e refaz as sessoes TLS do zero. Ele e o
+//  ULTIMO RECURSO: so acontece quando um servico esta bloqueado E o heap esta
+//  fragmentado a ponto de nao dar mais para recriar a sessao TLS (maior bloco
+//  contiguo abaixo de STALL_GUARD_MAX_BLOCK_FLOOR por STALL_GUARD_FRAGMENTED_MS).
+//  Servico parado com heap intacto NAO reinicia. As regras ficam em config.h.
 //
 //  Nada aqui aloca: apenas contadores em .bss. Chame update() a cada loop().
 // ============================================================================
@@ -32,10 +36,16 @@ struct Input {
   // e reiniciar em loop nao resolveria (o firmware avisa no boot).
   bool telegramEnabled = false;
   bool mqttEnabled = false;
-  // Instante (millis) do ultimo sucesso de cada servico. 0 = nenhum desde o
-  // boot; nesse caso o silencio conta a partir do fim da carencia do boot.
+  // Instante (millis) do ultimo sinal de vida de cada servico. 0 = nenhum desde
+  // o boot; nesse caso o silencio conta a partir do fim da carencia do boot. No
+  // MQTT, com a sessao de pe o main passa millis() (o servico esta vivo).
   uint32_t telegramLastOkMs = 0;
   uint32_t mqttLastOkMs = 0;
+  // Maior bloco contiguo livre (ESP.getMaxFreeBlockSize()) lido pelo chamador.
+  // Autoriza o reboot quando fica abaixo de STALL_GUARD_MAX_BLOCK_FLOOR: abaixo
+  // disso nem a recuperacao do gate consegue recriar a sessao TLS (heap "nao mais
+  // administravel"). A persistencia e cobrada por STALL_GUARD_FRAGMENTED_MS.
+  size_t maxFreeBlockBytes = 0;
 };
 
 // Inicia a janela de carencia (nenhum reboot nos primeiros
@@ -43,9 +53,11 @@ struct Input {
 void begin(uint32_t nowMs);
 
 // Chame a cada loop(). Avisa uma vez quando o bloqueio passa de
-// STALL_GUARD_FIRST_WARN_MS e reinicia o ESP ao atingir
-// TELEGRAM_STALL_REBOOT_MS / MQTT_STALL_REBOOT_MS. Retorna somente quando NAO
-// reiniciou - ESP.restart() nao retorna.
+// STALL_GUARD_FIRST_WARN_MS (e quando a fragmentacao persiste) e reinicia o ESP
+// SOMENTE ao atingir TELEGRAM_STALL_REBOOT_MS / MQTT_STALL_REBOOT_MS com o maior
+// bloco contiguo abaixo de STALL_GUARD_MAX_BLOCK_FLOOR por
+// STALL_GUARD_FRAGMENTED_MS. Retorna somente quando NAO reiniciou - ESP.restart()
+// nao retorna.
 void update(uint32_t nowMs, const Input &input);
 
 }  // namespace stall_guard

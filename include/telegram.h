@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 
+#include "alert_monitor.h"
 #include "history.h"
 #include "telegram_text.h"
 
@@ -10,7 +11,12 @@
 //
 //  Nao existe servico, bot ou proxy intermediario: o proprio firmware abre TLS
 //  com api.telegram.org (CA em telegram_ca.h), faz GET getUpdates e responde
-//  com POST sendMessage. Comandos desta etapa: /help e /status.
+//  com POST sendMessage. Comandos desta etapa: /help, /status e /warnings, com
+//  as abreviacoes /h, /s e /w.
+//
+//  Alem das respostas, o modulo entrega o aviso de boot e os ALERTAS de nivel
+//  (include/alert_monitor.h) pelo mesmo caminho de envio, uma mensagem por
+//  consulta.
 //
 //  Ciclo de vida:
 //    begin(nowMs)  - apenas estado; nenhuma conexao (nao bloqueia o setup);
@@ -41,6 +47,9 @@ struct TelegramContext {
   bool sampleValid = false;
   // Fonte dos agregados do /status. Nao ha segunda fonte de historico.
   const History *history = nullptr;
+  // Alertas de nivel: o /w le e escreve os limites e o modulo Telegram entrega
+  // UMA mensagem pendente por consulta (peek/confirm). Nao-const de proposito.
+  AlertMonitor *alerts = nullptr;
 };
 
 class Telegram {
@@ -80,6 +89,12 @@ class Telegram {
   // (ensureConnection + sendMessage) que as respostas de comando. Nao altera a
   // consulta (getUpdates) nem o offset.
   void sendBootNotice(uint32_t nowMs);
+
+  // Entrega UM alerta pendente por consulta, tambem pelo caminho de envio, um
+  // pouco antes da consulta (a mesma sessao serve as duas coisas). Sem pendencia
+  // - ou sem conseguir abrir a sessao - nao faz nada: o alerta continua na fila
+  // (persistida) e a proxima consulta tenta de novo.
+  void flushPendingAlerts(uint32_t nowMs, AlertMonitor *alerts);
 
   bool m_enabled = false;
   bool m_firstPoll = true;

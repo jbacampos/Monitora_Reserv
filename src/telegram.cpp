@@ -981,6 +981,10 @@ void Telegram::update(uint32_t nowMs, const TelegramContext &context) {
     sendBootNotice(nowMs);
   }
 
+  // Alertas de nivel: no maximo UM por consulta, pela mesma sessao (e antes de
+  // a consulta usa-la). O evento ja foi enfileirado por AlertMonitor::update().
+  flushPendingAlerts(nowMs, context.alerts);
+
   // DIAG: heap no inicio e no fim do poll. Fica aqui (ponto unico) para cobrir
   // todos os caminhos de saida de pollOnce().
   if constexpr (kDiag) {
@@ -1043,6 +1047,42 @@ void Telegram::sendBootNotice(uint32_t nowMs) {
                 static_cast<double>(millis()) / 1000.0,
                 static_cast<unsigned>(m_bootNoticeAttempts),
                 static_cast<unsigned>(TELEGRAM_BOOT_NOTICE_MAX_ATTEMPTS));
+}
+
+// ---------------------------------------------------------------------------
+//  Alertas de nivel - no maximo UMA mensagem por consulta
+//
+//  Mesmo caminho do aviso de boot (ensureConnection + sendMessage), portanto a
+//  mesma sessao TLS, o mesmo chat primario e os mesmos buffers: reusa g_message,
+//  que e consumido dentro do proprio sendMessage. Sem pendencia, sem sessao ou
+//  com falha de envio o alerta PERMANECE na fila persistida e a consulta
+//  seguinte tenta de novo.
+// ---------------------------------------------------------------------------
+void Telegram::flushPendingAlerts(uint32_t nowMs, AlertMonitor *alerts) {
+  if (alerts == nullptr || !alerts->peekPending(g_message, sizeof(g_message))) {
+    return;
+  }
+
+  const int64_t chatId = strtoll(ACTIVE_TELEGRAM_CHAT_ID, nullptr, 10);
+  if (chatId == 0) {
+    return;
+  }
+
+  if (!ensureConnection(nowMs)) {
+    return;  // sem sessao agora; o alerta continua pendente
+  }
+
+  if (!sendMessage(chatId, g_message)) {
+    ++m_failures;
+    Serial.printf("[%7.2f s] TG: alerta nao entregue; permanece na fila\n",
+                  static_cast<double>(millis()) / 1000.0);
+    return;
+  }
+
+  alerts->confirmPending();
+  Serial.printf("[%7.2f s] TG: alerta enviado (pendentes=%u)\n",
+                static_cast<double>(millis()) / 1000.0,
+                static_cast<unsigned>(alerts->pendingCount()));
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,6 +1291,22 @@ void Telegram::pollOnce(uint32_t nowMs, const TelegramContext &context) {
 // ---------------------------------------------------------------------------
 //  Respostas
 // ---------------------------------------------------------------------------
+// Nome do comando para o log (o texto cru recebido nao e guardado em lugar
+// nenhum alem do buffer normalizado).
+const char *commandName(TgCommand command) {
+  switch (command) {
+    case TgCommand::Help:
+      return "/help";
+    case TgCommand::Status:
+      return "/status";
+    case TgCommand::Warnings:
+      return "/warnings";
+    case TgCommand::None:
+    default:
+      return "?";
+  }
+}
+
 void Telegram::answerCommand(TgCommand command, const TelegramContext &context,
                              int64_t chatId) {
   if (command == TgCommand::Help) {
@@ -1260,6 +1316,38 @@ void Telegram::answerCommand(TgCommand command, const TelegramContext &context,
     buildStatusData(context, data);
     buildStatusMessage(data, FIRMWARE_VERSION, context.uptimeS, g_message,
                        sizeof(g_message));
+  } else if (command == TgCommand::Warnings) {
+    AlertMonitor *alerts = context.alerts;
+    if (alerts == nullptr) {
+      snprintf(g_message, sizeof(g_message), "Alertas de nível indisponíveis.");
+    } else {
+      // Os limites vigentes ficam guardados para a mensagem de erro: um /w
+      // recusado NAO pode alterar nada.
+      const alerts::Config current = alerts->config();
+      alerts::Config requested;
+      const WarningsParse parsed =
+          parseWarnings(tgArgsOf(g_normalized), requested);
+
+      if (parsed == WarningsParse::SHOW) {
+        buildWarningsMessage(current, alerts->level(), context.volumeL,
+                             context.sampleValid, g_message, sizeof(g_message));
+      } else if (parsed == WarningsParse::INVALID) {
+        buildWarningsErrorMessage("informe três números: /w lr lc hist", current,
+                                  g_message, sizeof(g_message));
+      } else {
+        const alerts::ConfigError error = alerts->applyConfig(
+            requested, context.volumeL, context.sampleValid);
+        if (error == alerts::ConfigError::OK) {
+          // Reapresenta os limites EFETIVADOS e o estado JA recalculado.
+          buildWarningsAppliedMessage(alerts->config(), alerts->level(),
+                                      context.volumeL, context.sampleValid,
+                                      g_message, sizeof(g_message));
+        } else {
+          buildWarningsErrorMessage(warningsErrorText(error), current,
+                                    g_message, sizeof(g_message));
+        }
+      }
+    }
   } else {
     return;
   }
@@ -1268,8 +1356,7 @@ void Telegram::answerCommand(TgCommand command, const TelegramContext &context,
   if (sendMessage(chatId, g_message)) {
     ++m_commands;
     Serial.printf("[%7.2f s] TG: %s respondido (%lu ms)\n",
-                  static_cast<double>(millis()) / 1000.0,
-                  command == TgCommand::Help ? "/help" : "/status",
+                  static_cast<double>(millis()) / 1000.0, commandName(command),
                   static_cast<unsigned long>(elapsedMs(start)));
   } else {
     ++m_failures;

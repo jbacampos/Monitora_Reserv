@@ -40,8 +40,17 @@ class ThingsBoard {
 
   bool connected() const { return m_connected; }
   // Instante (millis) da ultima sessao MQTT ACEITA pelo broker (0 = nenhuma).
-  // Unica fonte da guarda de bloqueio (stall_guard.h) para o reboot controlado.
+  // Diagnostico e apoio da guarda de bloqueio (stall_guard.h).
   uint32_t lastConnectedMs() const { return m_lastConnectedMs; }
+  // Ultimo sinal de vida do MQTT: aceite de sessao OU publicacao confirmada. A
+  // guarda usa este valor SOMENTE quando NAO ha sessao (com a sessao de pe o main
+  // passa millis(), pois o servico esta vivo); sem isso, uma sessao longa e
+  // saudavel - que nunca reconecta - parecia "parada" e reiniciava o ESP a cada
+  // MQTT_STALL_REBOOT_MS.
+  uint32_t lastActivityMs() const {
+    return (m_lastPublishMs > m_lastConnectedMs) ? m_lastPublishMs
+                                                 : m_lastConnectedMs;
+  }
   // true quando o RX do TLS foi ampliado para MQTT_TLS_RX_BUFFER_FALLBACK por
   // causa de um registro maior que o normal (o broker mudou a cadeia). Apenas
   // diagnostico: aparece no log serial e na linha periodica (mqtt=off(rx4096)).

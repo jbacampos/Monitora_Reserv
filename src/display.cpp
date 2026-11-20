@@ -29,8 +29,9 @@ void DisplayManager::begin(uint32_t nowMs) {
 
   m_on = true;
   m_onSinceMs = nowMs;
-  // Primeira indicacao de volume apenas no primeiro ciclo de 4 s, como no
-  // programa original (a mensagem de boot permanece visivel nesse intervalo).
+  // Primeira indicacao de volume apenas no primeiro ciclo de DISPLAY_REFRESH_MS,
+  // como no programa original (a mensagem de boot permanece visivel nesse
+  // intervalo).
   m_lastRefreshMs = nowMs;
 }
 
