@@ -11,7 +11,11 @@ Valida, sem device, o que sustenta a preservacao de dados do /w:
      sobrescrever o slot bom quando a gravacao falha;
   4. simulacao de REBOOT: limites e estado sobrevivem, alerta pendente e
      reentregue e NENHUM alerta duplicado e emitido;
-  5. fila de pendentes (limite, descarte do mais antigo) e rebaseline do /w.
+  5. fila de pendentes (limite, descarte do mais antigo) e rebaseline do /w;
+  6. REBASELINE pos-boot: a MELHORA e silenciosa (nao gera a mensagem enganosa
+     "recuperou-se... 100.622 L" logo apos o reboot) e a PIORA segue como alerta
+     normal, sem tocar nos pendentes;
+  7. CYCLE: o cenario de bancada cobre os QUATRO avisos dentro de um ciclo.
 
 Uso: python check_alerts.py
 """
@@ -116,6 +120,12 @@ SETTLE_MS = read_int(CONFIG_HEADER, "ALERT_SETTLE_MS")
 NORMAL, RISK, CRITICAL = 0, 1, 2
 NONE = 0
 RISK_ENTERED, CRITICAL_ENTERED, CRITICAL_RECOVERED, RISK_RECOVERED = 1, 2, 3, 4
+
+LEVEL_NAME = {NORMAL: "Normal", RISK: "Risco", CRITICAL: "Critico"}
+EVENT_NAME = {NONE: "nada", RISK_ENTERED: "atingiu o risco",
+              CRITICAL_ENTERED: "atingiu o critico",
+              CRITICAL_RECOVERED: "recuperou do critico",
+              RISK_RECOVERED: "recuperou do risco"}
 
 
 def encode_record(state, generation):
@@ -271,6 +281,7 @@ class Monitor:
                       "level": NORMAL, "pending": [], "generation": 0}
         self.persisted = False
         self.active_slot = 0
+        self.rebaselined = False
         self.load()
 
     def load(self):
@@ -307,6 +318,17 @@ class Monitor:
             return []
         if now_ms - self.boot_ms < SETTLE_MS:
             return []
+        # Rebaseline da PRIMEIRA avaliacao util do boot (espelho de
+        # AlertMonitor::update): so a MELHORA e silenciosa - o aparelho nao viu a
+        # recuperacao e o volume de agora nao e o da travessia. A piora (e o
+        # estado igual) seguem pelo step() normal, que ja emite so o alerta
+        # devido.
+        if not self.rebaselined:
+            self.rebaselined = True
+            now_level = level_for(self.state, volume)
+            if now_level < self.state["level"]:
+                self.state["level"] = now_level
+                self.store()
         events = []
         for _ in range(MAX_PENDING):
             event, level = step(self.state["level"], self.state, volume)
@@ -331,6 +353,10 @@ class Monitor:
         if sample_valid:
             self.state["level"] = level_for(cfg, volume)
         self.state["pending"] = []
+        # O /w ja recalculou o estado ("rebaseline" do operador): a primeira
+        # avaliacao do boot nao tem mais o que rebaselinar (um /w pode chegar
+        # antes do settle).
+        self.rebaselined = True
         self.store()
         return "OK"
 
@@ -482,8 +508,17 @@ def main():
     check(reborn.peek() == (CRITICAL_RECOVERED, 41000.0),
           "mensagem de recuperacao ainda nao enviada sobrevive ao reboot")
     reborn.confirm()
-    check(reborn.update(SETTLE_MS + 3000, 80000.0) == [RISK_RECOVERED],
-          "acima de risco+hist recupera o risco")
+    # O tanque ja tinha subido acima de risco+hist ENQUANTO o aparelho reiniciava:
+    # a travessia nao foi observada, entao o reboot rebaselina em silencio (secao
+    # 8). A recuperacao AO VIVO - a que interessa - vem logo abaixo.
+    check(reborn.update(SETTLE_MS + 3000, 80000.0) == [] and
+          reborn.state["level"] == NORMAL,
+          "reboot + tanque cheio: recuperacao nao observada nao gera mensagem")
+    check(reborn.update(SETTLE_MS + 4000, 50000.0) == [RISK_ENTERED],
+          "queda ao vivo volta a entrar no risco")
+    reborn.confirm()
+    check(reborn.update(SETTLE_MS + 5000, 80000.0) == [RISK_RECOVERED],
+          "acima de risco+hist recupera o risco (ao vivo)")
     reborn.confirm()
     check(reborn.state["level"] == NORMAL, "estado volta a NORMAL")
 
@@ -553,6 +588,151 @@ def main():
           "limites vigentes mantidos apos as recusas")
     check(latest(flash)["generation"] == before["generation"],
           "configuracao recusada NAO grava no flash")
+
+    print("\n8. Rebaseline pos-boot: melhora silenciosa, piora anunciada")
+    normal_liters = pct_liters(80)
+    risk_liters = pct_liters(45)
+    critical_liters = pct_liters(10)
+
+    def boot_with(level, volume, pending=()):
+        """Reboot com um registro persistido e a primeira avaliacao util."""
+        flash = Flash()
+        state = {"risk": DEFAULT_CFG["risk"], "critical": DEFAULT_CFG["critical"],
+                 "hist": DEFAULT_CFG["hist"], "level": level,
+                 "pending": list(pending), "generation": 7}
+        flash.files[ALERT_FILE_A] = encode_record(state, 7)
+        monitor = Monitor(flash, boot_ms=0)
+        return monitor, monitor.update(SETTLE_MS + 100, volume)
+
+    # MELHORA: o aparelho nao viu a recuperacao -> nenhuma mensagem, mas o estado
+    # passa a refletir o volume de agora.
+    for persisted, volume, expected in ((CRITICAL, normal_liters, NORMAL),
+                                        (CRITICAL, risk_liters, RISK),
+                                        (RISK, normal_liters, NORMAL)):
+        monitor, events = boot_with(persisted, volume)
+        check(events == [] and monitor.state["level"] == expected,
+              "persistido %s -> %.0f L: silencioso, estado %s"
+              % (LEVEL_NAME[persisted], volume, LEVEL_NAME[expected]))
+
+    # PIORA: um UNICO alerta (o degrau direto nao duplica o de risco) com o volume
+    # de AGORA, que e a informacao util para quem le.
+    for persisted, volume, event, expected in (
+            (NORMAL, critical_liters, CRITICAL_ENTERED, CRITICAL),
+            (NORMAL, risk_liters, RISK_ENTERED, RISK),
+            (RISK, critical_liters, CRITICAL_ENTERED, CRITICAL)):
+        monitor, events = boot_with(persisted, volume)
+        check(events == [event] and monitor.state["level"] == expected,
+              "piora %s -> %.0f L: um alerta (%s)"
+              % (LEVEL_NAME[persisted], volume, EVENT_NAME[event]))
+        pending = monitor.peek()
+        check(pending is not None and pending[0] == event and
+              abs(pending[1] - volume) < 1.0,
+              "o alerta leva o volume de AGORA (%.0f L)" % volume)
+
+    # IGUAL: nada e enviado (e o que impede alerta repetido a cada reboot).
+    for level, volume in ((CRITICAL, critical_liters), (RISK, risk_liters),
+                          (NORMAL, normal_liters)):
+        monitor, events = boot_with(level, volume)
+        check(events == [] and monitor.state["level"] == level,
+              "estado %s sem mudanca: reboot nao repete alerta"
+              % LEVEL_NAME[level])
+
+    # O caso de campo (2026-11-20): 2 pendentes reais + 2 "recuperacoes" espurias
+    # de reboot estouravam a fila de 2 e descartavam o alerta CRITICO mais antigo.
+    # Com o rebaseline silencioso a fila fica intacta.
+    flash = Flash()
+    state = {"risk": 60, "critical": 30, "hist": 5, "level": CRITICAL,
+             "pending": [(RISK_ENTERED, 69917.0), (CRITICAL_ENTERED, 34803.0)],
+             "generation": 2}
+    flash.files[ALERT_FILE_A] = encode_record(state, 2)
+    monitor = Monitor(flash, boot_ms=0)
+    check(monitor.update(SETTLE_MS + 100, normal_liters) == [],
+          "reboot com o tanque cheio: nenhuma recuperacao espuria")
+    check([event for event, _ in monitor.state["pending"]] ==
+          [RISK_ENTERED, CRITICAL_ENTERED],
+          "os DOIS pendentes reais sobrevivem (o critico de 34.803 L nao se perde)")
+
+    check("m_rebaselined" in monitor_cpp and "m_rebaselined = false;" in monitor_cpp,
+          "rebaseline roda uma unica vez por boot")
+    check("m_rebaselined = true;" in monitor_cpp,
+          "o /w consome o rebaseline (comando pode chegar antes do settle)")
+    check("alerts::levelFor(m_state.config, volumeL)" in monitor_cpp,
+          "o nivel de agora vem de levelFor() (sem evento)")
+    check("static_cast<uint8_t>(now) < static_cast<uint8_t>(m_state.level)"
+          in monitor_cpp,
+          "so a MELHORA e silenciosa (comparacao pelo valor do enum)")
+    check("estado pos-reboot %s -> %s" in monitor_cpp and
+          "[sem evento]" in monitor_cpp and "[alerta emitido]" in monitor_cpp,
+          "uma linha de log, com sufixo por caso")
+    monitor_header = open(os.path.join(ROOT, "include", "alert_monitor.h"),
+                          encoding="utf-8").read()
+    check("levelForVolume" in monitor_header and
+          "alerts::levelFor(m_state.config, volumeL)" in monitor_header,
+          "levelForVolume() expoe o estado de AGORA para o aviso de boot")
+
+    print("\n9. Cenário CYCLE: um ciclo cobre os QUATRO avisos")
+    sim = read_float_constants(CONFIG_HEADER,
+                              ["SIM_DRAINING_START_MM", "SIM_DRAINING_END_MM"])
+    drain_ms = read_int(CONFIG_HEADER, "SIM_CYCLE_DRAIN_MS")
+    fill_ms = read_int(CONFIG_HEADER, "SIM_CYCLE_FILL_MS")
+    simulator_cpp = open(os.path.join(ROOT, "src", "simulator.cpp"),
+                         encoding="utf-8").read()
+    top = sim["SIM_DRAINING_START_MM"]
+    bottom = sim["SIM_DRAINING_END_MM"]
+    period_ms = drain_ms + fill_ms
+
+    def cycle_liters(ms):
+        """Espelho do cenario CYCLE de src/simulator.cpp (onda triangular)."""
+        phase = ms % period_ms
+        if phase < drain_ms:
+            mm = top + (bottom - top) * (phase / drain_ms)
+        else:
+            mm = bottom + (top - bottom) * ((phase - drain_ms) / fill_ms)
+        return mm * VOL["kLitersPerMm"]
+
+    check("CYCLE," in _config_text and
+          "SIM_SCENARIO = SimScenario::CYCLE" in _config_text,
+          "CYCLE existe e e o cenario de bancada")
+    check("case SimScenario::CYCLE" in simulator_cpp and '"CYCLE"' in simulator_cpp,
+          "o simulador implementa e nomeia o cenario")
+    check("fmodf(" in simulator_cpp,
+          "o ciclo se repete pelo modulo do periodo (sem reiniciar o aparelho)")
+
+    level = NORMAL
+    events = []
+    ms = 0
+    while ms <= period_ms:
+        event, new_level = step(level, DEFAULT_CFG, cycle_liters(ms))
+        if event != NONE:
+            events.append((ms / 1000.0, event))
+            level = new_level
+        ms += 250
+    check([event for _, event in events] ==
+          [RISK_ENTERED, CRITICAL_ENTERED, CRITICAL_RECOVERED, RISK_RECOVERED],
+          "os quatro avisos saem em um ciclo (vistos: %s)"
+          % ", ".join(EVENT_NAME[event] for _, event in events))
+    if len(events) == 4:
+        times = [time_s for time_s, _ in events]
+        check(times == sorted(times),
+              "em ordem: %s" % ", ".join("%.0f s" % t for t in times))
+        check(times[0] > SETTLE_MS / 1000.0,
+              "o primeiro alerta vem depois do settle do boot (%.0f s)" % times[0])
+        check(times[-1] < period_ms / 1000.0 - 5.0,
+              "o quarto aviso cabe no ciclo (%.0f s < %.0f s)"
+              % (times[-1], period_ms / 1000.0))
+
+    # Margens: sem elas o cenario nao exercita entrada E recuperacao.
+    check(cycle_liters(0) >= recover_risk(DEFAULT_CFG),
+          "comeca em %.0f L, acima da recuperacao do risco (%.0f L)"
+          % (cycle_liters(0), recover_risk(DEFAULT_CFG)))
+    check(cycle_liters(drain_ms) <= enter_critical(DEFAULT_CFG),
+          "desce a %.0f L, abaixo da entrada do critico (%.0f L)"
+          % (cycle_liters(drain_ms), enter_critical(DEFAULT_CFG)))
+    check(abs(cycle_liters(period_ms) - cycle_liters(0)) < 1.0,
+          "e volta ao topo (ciclo periodico)")
+    check(cycle_liters(SETTLE_MS) > recover_risk(DEFAULT_CFG),
+          "no settle do boot ainda esta Normal (%.0f L): o rebaseline sai "
+          "silencioso" % cycle_liters(SETTLE_MS))
 
     print()
     if FAILURES:

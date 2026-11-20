@@ -88,7 +88,7 @@ class Telegram {
   // Aviso de boot: uma mensagem por boot, enviada pelo MESMO caminho de envio
   // (ensureConnection + sendMessage) que as respostas de comando. Nao altera a
   // consulta (getUpdates) nem o offset.
-  void sendBootNotice(uint32_t nowMs);
+  void sendBootNotice(uint32_t nowMs, const TelegramContext &context);
 
   // Entrega UM alerta pendente por consulta, tambem pelo caminho de envio, um
   // pouco antes da consulta (a mesma sessao serve as duas coisas). Sem pendencia

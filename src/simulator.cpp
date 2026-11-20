@@ -71,6 +71,27 @@ float Simulator::levelMm(uint32_t nowMs) const {
       level = lerp(SIM_RECOVERY_START_MM, SIM_RECOVERY_END_MM,
                    progress(elapsedMs, static_cast<float>(SIM_SCENARIO_DURATION_MS)));
       break;
+
+    case SimScenario::CYCLE: {
+      // Onda triangular: desce SIM_CYCLE_DRAIN_MS, sobe SIM_CYCLE_FILL_MS e
+      // recomeca. O modulo do periodo e o que torna o cenario repetitivo - e
+      // por isso ele cobre os QUATRO avisos (entrada e recuperacao do risco e
+      // do critico) sem precisar de reinicio.
+      const float period = static_cast<float>(SIM_CYCLE_DRAIN_MS + SIM_CYCLE_FILL_MS);
+      float phase = elapsedMs;
+      if (period > 0.0f) {
+        phase = fmodf(elapsedMs, period);
+      }
+      if (phase < static_cast<float>(SIM_CYCLE_DRAIN_MS)) {
+        level = lerp(SIM_DRAINING_START_MM, SIM_DRAINING_END_MM,
+                     progress(phase, static_cast<float>(SIM_CYCLE_DRAIN_MS)));
+      } else {
+        level = lerp(SIM_DRAINING_END_MM, SIM_DRAINING_START_MM,
+                     progress(phase - static_cast<float>(SIM_CYCLE_DRAIN_MS),
+                              static_cast<float>(SIM_CYCLE_FILL_MS)));
+      }
+      break;
+    }
   }
 
   return (level < 0.0f) ? 0.0f : level;
@@ -118,6 +139,8 @@ const char* Simulator::scenarioName(SimScenario scenario) {
       return "CRITICAL";
     case SimScenario::RECOVERY:
       return "RECOVERY";
+    case SimScenario::CYCLE:
+      return "CYCLE";
   }
   return "UNKNOWN";
 }

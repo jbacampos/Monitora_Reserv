@@ -33,6 +33,12 @@ class AlertMonitor {
   bool persisted() const { return m_persisted; }
   alerts::Config config() const { return m_state.config; }
   alerts::Level level() const { return m_state.level; }
+  // Nivel que o volume corresponde AGORA, sem emitir evento. Usado pelo aviso de
+  // boot, que precisa do estado REAL do tanque e nao do estado persistido (que
+  // pode ser de antes do reboot).
+  alerts::Level levelForVolume(float volumeL) const {
+    return alerts::levelFor(m_state.config, volumeL);
+  }
   // Estado em texto ("Normal"/"Risco"/"Critico") para o log serial.
   const char *levelText() const;
   uint8_t pendingCount() const { return m_state.pendingCount; }
@@ -60,4 +66,6 @@ class AlertMonitor {
   uint8_t m_activeSlot = 0;  // slot que contem o estado carregado
   bool m_persisted = false;
   bool m_fsWarned = false;
+  // Primeira avaliacao util do boot ja passou? (ver o rebaseline em update())
+  bool m_rebaselined = false;
 };

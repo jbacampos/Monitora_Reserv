@@ -57,6 +57,7 @@ void AlertMonitor::begin(uint32_t nowMs) {
   m_bootMs = nowMs;
   m_state = alerts::Persisted();
   m_state.config = defaultConfig();
+  m_rebaselined = false;
   load();
 }
 
@@ -176,6 +177,34 @@ void AlertMonitor::update(uint32_t nowMs, float volumeL, bool sampleValid) {
     return;
   }
 
+  // PRIMEIRA avaliacao util depois do boot: o estado veio da FLASH (ou dos
+  // defaults) e o volume pode ter mudado enquanto o aparelho estava fora.
+  //   PIOROU  -> nada especial: o step() abaixo emite o alerta devido (degrau
+  //              NORMAL->critico ja emite SO o alerta critico) - o operador
+  //              precisa saber, mesmo sem ter visto a travessia.
+  //   MELHOROU -> rebaseline SILENCIOSO. O aparelho nao viu a recuperacao e o
+  //              volume de agora nao e o da travessia, o que produzia
+  //              "reservatorio recuperou-se do nivel critico - 100.622 L" logo
+  //              apos o reboot. Mesma ideia do /w, que tambem recalcula o estado
+  //              sem evento ao trocar os limites.
+  if (!m_rebaselined) {
+    m_rebaselined = true;
+    const alerts::Level now = alerts::levelFor(m_state.config, volumeL);
+    if (static_cast<uint8_t>(now) < static_cast<uint8_t>(m_state.level)) {
+      Serial.printf(
+          PSTR("[%7.2f s] Alertas: estado pos-reboot %s -> %s (%.1f L) [sem evento]\n"),
+          static_cast<double>(nowMs) / 1000.0, levelName(m_state.level),
+          levelName(now), static_cast<double>(volumeL));
+      m_state.level = now;
+      store();
+    } else if (now != m_state.level) {
+      Serial.printf(
+          PSTR("[%7.2f s] Alertas: estado pos-reboot %s -> %s (%.1f L) [alerta emitido]\n"),
+          static_cast<double>(nowMs) / 1000.0, levelName(m_state.level),
+          levelName(now), static_cast<double>(volumeL));
+    }
+  }
+
   bool changed = false;
   // Esvazia transicoes em CADEIA no mesmo passo (ex.: recuperou do critico e,
   // logo, do risco). No maximo MAX_PENDING eventos por avaliacao.
@@ -229,6 +258,11 @@ alerts::ConfigError AlertMonitor::applyConfig(const alerts::Config &cfg,
     m_state.pendingEvent[i] = alerts::Event::NONE;
     m_state.pendingVolumeL[i] = 0.0f;
   }
+
+  // O /w acabou de definir o estado a partir do volume atual: nao existe mais
+  // "estado de antes do reboot" para a primeira avaliacao rebaselinar (um /w
+  // pode chegar antes do ALERT_SETTLE_MS).
+  m_rebaselined = true;
 
   store();
 

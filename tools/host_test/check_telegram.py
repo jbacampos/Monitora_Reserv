@@ -678,9 +678,12 @@ def classify_boot_reason(ota_marker, reset_reason):
     return 8
 
 
-def build_boot_message(reason_code, version):
-    return "MoniRes reiniciado.\nVersão: %s\nMotivo: %s" % (
+def build_boot_message(reason_code, version, level=None, liters=None):
+    message = "MoniRes reiniciado.\nVersão: %s\nMotivo: %s" % (
         version, BOOT_REASON_TEXT[reason_code])
+    if level is None:
+        return message + "\nNível: sem leitura"
+    return message + "\nNível: %s - %s" % (level, liters)
 
 
 def test_boot_notice():
@@ -690,19 +693,31 @@ def test_boot_notice():
     text_header = strip_comments(read_text(TEXT_HEADER))
     telegram = strip_comments(read_text(TELEGRAM_CPP))
 
-    # 1) Mensagem no MESMO padrao do Monitora_DG: tres linhas, nada mais.
-    message = build_boot_message(1, "1.0.0")
+    # 1) Mensagem: QUATRO linhas - a ultima da o estado do tanque AGORA, que da
+    # contexto ao reboot (o estado persistido pode ser de antes).
+    message = build_boot_message(1, "1.0.0", level="Normal", liters="102.047 L")
     lines = message.split("\n")
-    check(len(lines) == 3, "aviso tem exatamente 3 linhas (%d)" % len(lines))
+    check(len(lines) == 4, "aviso tem exatamente 4 linhas (%d)" % len(lines))
     check(lines[0] == "MoniRes reiniciado.", "1a linha: '<firmware> reiniciado.'")
     check(lines[1] == "Versão: 1.0.0", "2a linha: versao do firmware")
     check(lines[2] == "Motivo: Energização", "3a linha: motivo do boot")
+    check(lines[3] == "Nível: Normal - 102.047 L",
+          "4a linha: estado do tanque agora (com separador de milhar)")
+    no_reading = build_boot_message(1, "1.0.0").split("\n")
+    check(len(no_reading) == 4 and no_reading[3] == "Nível: sem leitura",
+          "sem amostra valida a 4a linha diz 'sem leitura'")
     check(len(message) < TG_MESSAGE_MAX, "cabe no buffer de mensagem (%d B)"
           % len(message))
-    check('"MoniRes reiniciado.\\n"' in text_header,
+    check('TG_TEXT("MoniRes reiniciado.\\n"' in text_header,
           "texto do aviso vive em include/telegram_text.h")
-    check('"Versão: %s\\n"' in text_header and '"Motivo: %s"' in text_header,
-          "buildBootMessage usa versao e motivo")
+    check('"Versão: %s\\n"' in text_header and '"Motivo: %s\\n"' in text_header and
+          '"Nível: %s - %s"' in text_header and '"Nível: sem leitura"' in text_header,
+          "buildBootMessage usa versao, motivo e estado do nivel")
+    check("alertLevelName(level)" in text_header and
+          "formatLiters(volumeL, liters" in text_header,
+          "estado e volume vem das tabelas/formatadores do /w (uma fonte)")
+    check("alerts::Level level, bool hasVolume, float volumeL" in text_header,
+          "a camada pura recebe o nivel e o volume (nao recalcula nada)")
 
     # 2) Tabela unica codigo -> descricao (nenhuma copia em outro arquivo).
     for code, description in BOOT_REASON_TEXT.items():
@@ -721,16 +736,19 @@ def test_boot_notice():
     check("nullptr" in boot_header, "reason ausente cai em 'Desconhecido'")
 
     # 4) Envio: uma vez por boot, pelo caminho que ja funciona.
-    check("void Telegram::sendBootNotice(uint32_t nowMs)" in telegram,
-          "aviso implementado em src/telegram.cpp")
+    check("void Telegram::sendBootNotice(uint32_t nowMs, const TelegramContext &context)"
+          in telegram, "aviso implementado em src/telegram.cpp")
     check("if (!m_bootNoticeSent)" in telegram,
           "enviado uma unica vez por boot")
     check("m_bootNoticeSent = true;" in telegram,
           "marca de enviado so depois do envio")
     check("sendMessage(chatId, g_message)" in telegram,
           "usa o MESMO sendMessage das respostas de comando")
-    check("buildBootMessage(m_bootReason, FIRMWARE_VERSION" in telegram,
+    check("buildBootMessage(m_bootReason, FIRMWARE_VERSION, level, hasLevel" in telegram,
           "texto vem da camada pura (telegram_text.h)")
+    check("levelForVolume(context.volumeL)" in telegram and
+          "context.sampleValid && context.alerts != nullptr" in telegram,
+          "nivel da mensagem vem do volume de AGORA (nao do estado persistido)")
     check("TELEGRAM_BOOT_NOTICE_MAX_ATTEMPTS" in telegram,
           "desiste depois de N consultas sem entrega")
     body = telegram.split("void Telegram::sendBootNotice")[1].split(

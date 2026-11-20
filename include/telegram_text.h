@@ -289,6 +289,20 @@ inline void formatLitersBare(float liters, char *out, size_t outSize) {
   formatGroupedLong(value, out, outSize);
 }
 
+// Nome do estado do nivel ("Normal", "Risco", "Crítico"). Usado pelo aviso de
+// boot e pelos dois blocos do /w - uma unica fonte para os TRES textos.
+inline const char *alertLevelName(alerts::Level level) {
+  switch (level) {
+    case alerts::Level::RISK:
+      return TG_TEXT("Risco");
+    case alerts::Level::CRITICAL:
+      return TG_TEXT("Crítico");
+    case alerts::Level::NORMAL:
+    default:
+      return TG_TEXT("Normal");
+  }
+}
+
 // ---------------------------------------------------------------------------
 //  /status
 // ---------------------------------------------------------------------------
@@ -387,37 +401,45 @@ inline void buildHelpMessage(char *out, size_t outSize) {
 // ---------------------------------------------------------------------------
 //  Aviso de boot
 // ---------------------------------------------------------------------------
-// Mesmo padrao visual e de conteudo do Monitora_DG: tres linhas, nada mais.
+// Mesmo padrao visual e de conteudo do Monitora_DG, agora com QUATRO linhas:
 //   MoniRes reiniciado.
 //   Versão: 1.0.0
 //   Motivo: Energização
+//   Nível: Normal - 102.047 L      (ou "Nível: sem leitura")
 // O texto usa acentuacao (UTF-8) como todas as mensagens do MoniRes; o motivo
 // vem da tabela unica de include/boot_reason.h.
-inline void buildBootMessage(uint8_t bootReason, const char *version, char *out,
-                             size_t outSize) {
+//
+// A linha do nivel e o estado AGORA (derivado do volume que o chamador passa),
+// nao o estado persistido: o reboot pode ter acontecido com o tanque em outro
+// nivel, e e essa a informacao que da contexto aos alertas que vierem depois
+// (inclusive o rebaseline silencioso de AlertMonitor, que nao envia mensagem).
+inline void buildBootMessage(uint8_t bootReason, const char *version,
+                             alerts::Level level, bool hasVolume, float volumeL,
+                             char *out, size_t outSize) {
+  if (!hasVolume) {
+    snprintf(out, outSize,
+             TG_TEXT("MoniRes reiniciado.\n"
+                     "Versão: %s\n"
+                     "Motivo: %s\n"
+                     "Nível: sem leitura"),
+             version, bootReasonDescription(bootReason));
+    return;
+  }
+
+  char liters[24];
+  formatLiters(volumeL, liters, sizeof(liters));
   snprintf(out, outSize,
            TG_TEXT("MoniRes reiniciado.\n"
                    "Versão: %s\n"
-                   "Motivo: %s"),
-           version, bootReasonDescription(bootReason));
+                   "Motivo: %s\n"
+                   "Nível: %s - %s"),
+           version, bootReasonDescription(bootReason), alertLevelName(level),
+           liters);
 }
 
 // ---------------------------------------------------------------------------
 //  /warnings - limites
 // ---------------------------------------------------------------------------
-// Nome do estado do nivel ("Normal", "Risco", "Crítico").
-inline const char *alertLevelName(alerts::Level level) {
-  switch (level) {
-    case alerts::Level::RISK:
-      return TG_TEXT("Risco");
-    case alerts::Level::CRITICAL:
-      return TG_TEXT("Crítico");
-    case alerts::Level::NORMAL:
-    default:
-      return TG_TEXT("Normal");
-  }
-}
-
 // Motivo, em portugues, de uma configuracao recusada.
 inline const char *warningsErrorText(alerts::ConfigError error) {
   switch (error) {

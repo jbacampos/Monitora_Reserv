@@ -992,7 +992,7 @@ void Telegram::update(uint32_t nowMs, const TelegramContext &context) {
   // vai usar em seguida (ensureConnection nao aloca duas vezes). Uma tentativa
   // por consulta; apos TELEGRAM_BOOT_NOTICE_MAX_ATTEMPTS o aviso e descartado.
   if (!m_bootNoticeSent) {
-    sendBootNotice(nowMs);
+    sendBootNotice(nowMs, context);
   }
 
   // Alertas de nivel: no maximo UM por consulta, pela mesma sessao (e antes de
@@ -1030,7 +1030,7 @@ void Telegram::update(uint32_t nowMs, const TelegramContext &context) {
 //  falhar, a proxima consulta tenta de novo, ate
 //  TELEGRAM_BOOT_NOTICE_MAX_ATTEMPTS.
 // ---------------------------------------------------------------------------
-void Telegram::sendBootNotice(uint32_t nowMs) {
+void Telegram::sendBootNotice(uint32_t nowMs, const TelegramContext &context) {
   if (m_bootNoticeSent ||
       m_bootNoticeAttempts >= TELEGRAM_BOOT_NOTICE_MAX_ATTEMPTS) {
     return;
@@ -1048,7 +1048,15 @@ void Telegram::sendBootNotice(uint32_t nowMs) {
   }
   ++m_bootNoticeAttempts;
 
-  buildBootMessage(m_bootReason, FIRMWARE_VERSION, g_message, sizeof(g_message));
+  // Linha do nivel: o estado do volume de AGORA (nao o persistido, que pode ser
+  // de antes do reboot). Sem amostra valida ainda, a mensagem diz "sem leitura".
+  const bool hasLevel = context.sampleValid && context.alerts != nullptr;
+  const alerts::Level level =
+      hasLevel ? context.alerts->levelForVolume(context.volumeL)
+               : alerts::Level::NORMAL;
+
+  buildBootMessage(m_bootReason, FIRMWARE_VERSION, level, hasLevel,
+                   context.volumeL, g_message, sizeof(g_message));
   if (sendMessage(chatId, g_message)) {
     m_bootNoticeSent = true;
     Serial.printf("[%7.2f s] TG: aviso de boot enviado (motivo=%s)\n",

@@ -98,10 +98,11 @@ enum class SimScenario : uint8_t {
   OSCILLATING, // oscilacao senoidal
   CRITICAL,    // nivel abaixo do offset do sensor (volume nulo)
   RECOVERY,    // recuperacao a partir de nivel critico
+  CYCLE,       // esvazia, enche e recomeca (exercita os QUATRO alertas)
 };
 
 // Cenario ativo. Troque aqui para testar os demais comportamentos.
-constexpr SimScenario SIM_SCENARIO = SimScenario::DRAINING;
+constexpr SimScenario SIM_SCENARIO = SimScenario::CYCLE;
 
 constexpr bool  SIM_NOISE     = true;   // ruido artificial nas amostras ADC
 constexpr float SIM_TIME_SCALE = 1.0f; // 1x: rampas de 120 s reais
@@ -122,6 +123,21 @@ constexpr float SIM_OSCILLATING_PERIOD_MS    = 60000.0f;
 constexpr float SIM_CRITICAL_LEVEL_MM        = 0.0f;
 constexpr float SIM_RECOVERY_START_MM      = 200.0f;
 constexpr float SIM_RECOVERY_END_MM        = 2200.0f;
+
+// CYCLE: esvazia de SIM_DRAINING_START_MM ate SIM_DRAINING_END_MM em
+// SIM_CYCLE_DRAIN_MS, enche de volta em SIM_CYCLE_FILL_MS e recomeca, para
+// sempre. Com os limites de fabrica (risco 60%, critico 30%, histerese 5%)
+// um ciclo de 240 s percorre, nesta ordem: atingiu o risco (~41 s), atingiu o
+// critico (~84 s), recuperou-se do critico (~163 s) e recuperou-se do risco
+// (~206 s) - os quatro avisos, mais as histereses de um lado so. O
+// OSCILLATING, em contraste, oscila em volta de 1500 mm e so cruza o risco.
+constexpr uint32_t SIM_CYCLE_DRAIN_MS = 120000UL;
+constexpr uint32_t SIM_CYCLE_FILL_MS  = 120000UL;
+
+static_assert(SIM_CYCLE_DRAIN_MS > 0 && SIM_CYCLE_FILL_MS > 0,
+              "as duas pernas do CYCLE precisam ter duracao");
+static_assert(SIM_DRAINING_END_MM < SIM_DRAINING_START_MM,
+              "o CYCLE espera uma rampa de descida e a mesma de volta");
 
 static_assert(SIM_TIME_SCALE > 0.0f, "SIM_TIME_SCALE deve ser maior que zero");
 static_assert(SAMPLE_INTERVAL_MS > 0, "SAMPLE_INTERVAL_MS deve ser maior que zero");
