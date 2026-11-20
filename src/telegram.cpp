@@ -794,7 +794,13 @@ void Telegram::begin(uint32_t nowMs) {
   m_enabled = !telegramCredentialsPending();
   m_firstPoll = true;
   m_updateOffset = 0;
-  m_lastPollMs = nowMs;  // primeira consulta TELEGRAM_POLL_INTERVAL_MS apos o boot
+  // Primeira consulta TELEGRAM_FIRST_POLL_DELAY_MS depois do boot; as seguintes
+  // respeitam TELEGRAM_POLL_INTERVAL_MS. O valor inicial "desloca" o intervalo
+  // (conta wrap-safe, com millis() pequeno no setup) para a janela ja estar
+  // vencida assim que Wi-Fi e relogio ficarem prontos: assim a sessao TLS nasce
+  // com o heap inteiro, antes de o MQTT reservar o TLS dele.
+  m_lastPollMs =
+      nowMs - (TELEGRAM_POLL_INTERVAL_MS - TELEGRAM_FIRST_POLL_DELAY_MS);
   m_polls = 0;
   m_commands = 0;
   m_failures = 0;
@@ -858,6 +864,14 @@ void Telegram::update(uint32_t nowMs, const TelegramContext &context) {
 
   if (WiFi.status() != WL_CONNECTED) {
     closeConnection();
+    return;
+  }
+
+  // Sem relogio valido o BearSSL recusa a cadeia (BR_ERR_X509_EXPIRED, medido em
+  // campo em 2026-11-20): a consulta ESPERA o NTP sem consumir o intervalo. E o
+  // que permite a primeira consulta sair poucos segundos depois do boot, quando
+  // o heap ainda esta inteiro.
+  if (!device_clock::synced()) {
     return;
   }
 
@@ -1074,13 +1088,13 @@ void Telegram::flushPendingAlerts(uint32_t nowMs, AlertMonitor *alerts) {
 
   if (!sendMessage(chatId, g_message)) {
     ++m_failures;
-    Serial.printf("[%7.2f s] TG: alerta nao entregue; permanece na fila\n",
+    Serial.printf(PSTR("[%7.2f s] TG: alerta nao entregue; permanece na fila\n"),
                   static_cast<double>(millis()) / 1000.0);
     return;
   }
 
   alerts->confirmPending();
-  Serial.printf("[%7.2f s] TG: alerta enviado (pendentes=%u)\n",
+  Serial.printf(PSTR("[%7.2f s] TG: alerta enviado (pendentes=%u)\n"),
                 static_cast<double>(millis()) / 1000.0,
                 static_cast<unsigned>(alerts->pendingCount()));
 }
@@ -1319,7 +1333,8 @@ void Telegram::answerCommand(TgCommand command, const TelegramContext &context,
   } else if (command == TgCommand::Warnings) {
     AlertMonitor *alerts = context.alerts;
     if (alerts == nullptr) {
-      snprintf(g_message, sizeof(g_message), "Alertas de nível indisponíveis.");
+      snprintf(g_message, sizeof(g_message),
+               PSTR("Alertas de nível indisponíveis."));
     } else {
       // Os limites vigentes ficam guardados para a mensagem de erro: um /w
       // recusado NAO pode alterar nada.
@@ -1332,8 +1347,8 @@ void Telegram::answerCommand(TgCommand command, const TelegramContext &context,
         buildWarningsMessage(current, alerts->level(), context.volumeL,
                              context.sampleValid, g_message, sizeof(g_message));
       } else if (parsed == WarningsParse::INVALID) {
-        buildWarningsErrorMessage("informe três números: /w lr lc hist", current,
-                                  g_message, sizeof(g_message));
+        buildWarningsErrorMessage(PSTR("informe três números: /w lr lc hist"),
+                                  current, g_message, sizeof(g_message));
       } else {
         const alerts::ConfigError error = alerts->applyConfig(
             requested, context.volumeL, context.sampleValid);

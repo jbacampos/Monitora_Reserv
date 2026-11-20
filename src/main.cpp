@@ -69,15 +69,15 @@ void printDiagnostics(uint32_t nowMs) {
   const volume::Measurement& m = g_lastMeasurement;
 
   Serial.printf(
-      "[%7.2f s] adc=%u | tensao=%.3f V | leitura=%.1f mm | altura=%.1f mm | "
-      "vol_inst=%.1f L | vol_filt=%.1f L",
+      PSTR("[%7.2f s] adc=%u | tensao=%.3f V | leitura=%.1f mm | altura=%.1f mm | "
+           "vol_inst=%.1f L | vol_filt=%.1f L"),
       static_cast<double>(nowMs) / 1000.0, static_cast<unsigned>(m.adc),
       static_cast<double>(m.voltageV), static_cast<double>(m.sensorMm),
       static_cast<double>(m.levelMm), static_cast<double>(m.liters),
       static_cast<double>(g_filteredLiters));
 
   if constexpr (TEST_MODE) {
-    Serial.printf(" | cenario=%s | amostras=%u/%u",
+    Serial.printf(PSTR(" | cenario=%s | amostras=%u/%u"),
                   Simulator::scenarioName(SIM_SCENARIO),
                   static_cast<unsigned>(g_volumeFilter.sampleCount()),
                   static_cast<unsigned>(MOVING_AVERAGE_WINDOW));
@@ -86,17 +86,17 @@ void printDiagnostics(uint32_t nowMs) {
   // `mqtt` mostra tambem o RX de emergencia quando ativo (off(rx4096)): sem isso
   // uma sessao recusada por registro grande pareceria apenas "broker fora".
   char mqttState[12];
-  snprintf(mqttState, sizeof(mqttState), "%s%s",
+  snprintf(mqttState, sizeof(mqttState), PSTR("%s%s"),
            g_tb.connected() ? "ok" : "off",
            g_tb.rxEscalated() ? "(rx4096)" : "");
 
-  Serial.printf(" | wifi=%s | mqtt=%s | hora=%s | publicadas=%lu | fila=%lu",
+  Serial.printf(PSTR(" | wifi=%s | mqtt=%s | hora=%s | publicadas=%lu | fila=%lu"),
                 g_wifi.connected() ? "ok" : "off", mqttState,
                 device_clock::synced() ? "ok" : "off",
                 static_cast<unsigned long>(g_tb.publishCount()),
                 static_cast<unsigned long>(g_tb.queuePending()));
 
-  Serial.printf(" | hist=%s",
+  Serial.printf(PSTR(" | hist=%s"),
                 !g_history.ready() ? "off"
                                    : (g_history.degraded() ? "degradado" : "ok"));
 
@@ -107,13 +107,13 @@ void printDiagnostics(uint32_t nowMs) {
   // o que escondia um gate de heap fechado.
   char tgState[24];
   g_telegram.stateText(tgState, sizeof(tgState), nowMs);
-  Serial.printf(" | heap=%u/%u | tg=%s",
+  Serial.printf(PSTR(" | heap=%u/%u | tg=%s"),
                 static_cast<unsigned>(ESP.getFreeHeap()),
                 static_cast<unsigned>(ESP.getMaxFreeBlockSize()), tgState);
 
   // Alertas de nivel: estado e quantos ainda esperam envio. Sem isso, um alerta
   // parado na fila (heap fechado) ficaria invisivel no log.
-  Serial.printf(" | alertas=%s(%u)", g_alerts.levelText(),
+  Serial.printf(PSTR(" | alertas=%s(%u)"), g_alerts.levelText(),
                 static_cast<unsigned>(g_alerts.pendingCount()));
 
   Serial.println();
@@ -122,40 +122,42 @@ void printDiagnostics(uint32_t nowMs) {
 void printStartup() {
   Serial.println();
   Serial.println(F("=== MoniRes - Etapa 2 ==="));
-  Serial.printf("Modo: %s\n", TEST_MODE ? "TESTE (simulador + credenciais de teste)"
-                                        : "PRODUCAO (analogRead A0 + credenciais de producao)");
+  Serial.printf(PSTR("Modo: %s\n"),
+                TEST_MODE ? "TESTE (simulador + credenciais de teste)"
+                          : "PRODUCAO (analogRead A0 + credenciais de producao)");
 
   if constexpr (TEST_MODE) {
-    Serial.printf("Cenario: %s | SIM_NOISE=%s | SIM_TIME_SCALE=%.1fx\n",
+    Serial.printf(PSTR("Cenario: %s | SIM_NOISE=%s | SIM_TIME_SCALE=%.1fx\n"),
                   Simulator::scenarioName(SIM_SCENARIO), SIM_NOISE ? "on" : "off",
                   static_cast<double>(SIM_TIME_SCALE));
   }
 
   Serial.printf(
-      "Amostragem: %lu ms | display: %lu ms | desliga: %lu ms | diag: %lu ms\n",
+      PSTR("Amostragem: %lu ms | display: %lu ms | desliga: %lu ms | diag: %lu ms\n"),
       static_cast<unsigned long>(SAMPLE_INTERVAL_MS),
       static_cast<unsigned long>(DISPLAY_REFRESH_MS),
       static_cast<unsigned long>(DISPLAY_ON_TIME_MS),
       static_cast<unsigned long>(DIAGNOSTIC_INTERVAL_MS));
 
   Serial.printf(
-      "Publicacao: delta >= %.1f L | heartbeat: %lu min | intervalo minimo: %lu s\n",
+      PSTR("Publicacao: delta >= %.1f L | heartbeat: %lu min | intervalo minimo: %lu s\n"),
       static_cast<double>(TB_PUBLISH_DELTA_LITERS),
       static_cast<unsigned long>(TB_HEARTBEAT_INTERVAL_MS / 60000UL),
       static_cast<unsigned long>(TB_MIN_PUBLISH_INTERVAL_MS / 1000UL));
 
   Serial.println(
-      "Fila offline: LittleFS (segmentos com CRC32, replay cronologico)");
-  Serial.println("Telemetria: volume_l + ts (epoch ms) | uptime_s: atributo");
-  Serial.printf("Historico: %u dias | snapshot a cada %lu min | amostragem %lu s\n",
+      PSTR("Fila offline: LittleFS (segmentos com CRC32, replay cronologico)"));
+  Serial.println(
+      PSTR("Telemetria: volume_l + ts (epoch ms) | uptime_s: atributo"));
+  Serial.printf(PSTR("Historico: %u dias | snapshot a cada %lu min | amostragem %lu s\n"),
                 static_cast<unsigned>(history_record::SLOTS),
                 static_cast<unsigned long>(HIST_SNAPSHOT_INTERVAL_MS / 60000UL),
                 static_cast<unsigned long>(HIST_SAMPLE_INTERVAL_MS / 1000UL));
 
   // Alertas: os defaults ficam em config.h; os limites EFETIVOS podem ter sido
   // trocados por /w e sao carregados do LittleFS em g_alerts.begin().
-  Serial.printf("Alertas: risco %u%% | critico %u%% | histerese %u%% | "
-                "ref. 100%% = %lu L | settle %lu s\n",
+  Serial.printf(PSTR("Alertas: risco %u%% | critico %u%% | histerese %u%% | "
+                     "ref. 100%% = %lu L | settle %lu s\n"),
                 static_cast<unsigned>(ALERT_DEFAULT_RISK_PCT),
                 static_cast<unsigned>(ALERT_DEFAULT_CRITICAL_PCT),
                 static_cast<unsigned>(ALERT_DEFAULT_HIST_PCT),
@@ -163,8 +165,8 @@ void printStartup() {
                 static_cast<unsigned long>(ALERT_SETTLE_MS / 1000UL));
 
   Serial.printf(
-      "Guarda: TG %lu min | MQTT %lu min | aviso %lu min | carencia %lu s | "
-      "renovacao TG %lu min\n",
+      PSTR("Guarda: TG %lu min | MQTT %lu min | aviso %lu min | carencia %lu s | "
+           "renovacao TG %lu min\n"),
       static_cast<unsigned long>(TELEGRAM_STALL_REBOOT_MS / 60000UL),
       static_cast<unsigned long>(MQTT_STALL_REBOOT_MS / 60000UL),
       static_cast<unsigned long>(STALL_GUARD_FIRST_WARN_MS / 60000UL),
@@ -235,14 +237,6 @@ void loop() {
   // telemetria nem fila (o timestamp original e obrigatorio).
   device_clock::update(now, g_wifi.connected());
 
-  // ThingsBoard: recebe os valores ja calculados e decide quando publicar.
-  TelemetrySample sample;
-  sample.volumeL = g_filteredLiters;
-  sample.timestampMs = g_lastSampleTimestampMs;
-  sample.uptimeS = g_uptime.seconds();
-  sample.valid = g_hasSample;
-  g_tb.update(now, sample);
-
   // Historico diario: auxiliar e independente da comunicacao. Usa o mesmo
   // timestamp da medicao que a telemetria recebeu.
   g_history.update(now, device_clock::synced(), g_lastSampleTimestampMs,
@@ -252,10 +246,14 @@ void loop() {
   // por passo. Vem ANTES do Telegram para o alerta sair na mesma consulta.
   g_alerts.update(now, g_filteredLiters, g_hasSample);
 
-  // Telegram: primeira consulta a Bot API TELEGRAM_POLL_INTERVAL_MS depois do
-  // boot. Recebe o MESMO volume enviado ao ThingsBoard, o uptime acumulado
-  // (imune ao rollover de millis()) e o historico (unica fonte dos agregados).
-  // A consulta e limitada em tempo e nao altera nenhum outro modulo.
+  // Telegram ANTES do ThingsBoard, DE PROPOSITO: a primeira consulta cria a
+  // sessao TLS com o heap inteiro (TELEGRAM_FIRST_POLL_DELAY_MS apos o boot),
+  // antes de o MQTT reservar os ~3,4 KB do TLS dele. Com o MQTT ja conectado
+  // restam ~12,8 KB e o gate de 14,08 KB nunca abriria - medido em campo em
+  // 2026-11-20, com o bot mudo e os alertas presos na fila. Depois de criada, a
+  // sessao e REAPROVEITADA e o gate deixa de ser consultado.
+  // Recebe o MESMO volume enviado ao ThingsBoard, o uptime acumulado (imune ao
+  // rollover de millis()) e o historico (unica fonte dos agregados).
   TelegramContext telegramContext;
   telegramContext.volumeL = g_filteredLiters;
   telegramContext.uptimeS = g_uptime.seconds();
@@ -263,6 +261,14 @@ void loop() {
   telegramContext.history = &g_history;
   telegramContext.alerts = &g_alerts;
   g_telegram.update(now, telegramContext);
+
+  // ThingsBoard: recebe os valores ja calculados e decide quando publicar.
+  TelemetrySample sample;
+  sample.volumeL = g_filteredLiters;
+  sample.timestampMs = g_lastSampleTimestampMs;
+  sample.uptimeS = g_uptime.seconds();
+  sample.valid = g_hasSample;
+  g_tb.update(now, sample);
 
   // Diagnostico em frequencia propria, independente da aquisicao.
   if ((now - g_lastDiagnosticMs) >= DIAGNOSTIC_INTERVAL_MS) {

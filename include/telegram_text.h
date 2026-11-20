@@ -8,6 +8,26 @@
 #include "alerts.h"
 #include "boot_reason.h"
 
+// ---------------------------------------------------------------------------
+//  Literais na FLASH (nao na DRAM)
+//
+//  No ESP8266 o .rodata vive na DRAM (ver o linker script do core): cada byte de
+//  texto custa 1 byte de HEAP. As mensagens do Telegram sao a maior parte do
+//  texto do firmware, entao elas vao para a flash com PSTR(), que o core coloca
+//  em ".irom0.pstr.*" - uma regiao mapeada em memoria, lida como um ponteiro
+//  normal. No host (espelhos em Python, sem Arduino) a macro nao existe e os
+//  literais continuam comuns, preservando a "camada pura".
+//
+//  O QUE muda e apenas ONDE o texto mora: a formatacao continua sendo feita pelo
+//  snprintf/Serial.printf de sempre (newlib), inclusive %f e %lu.
+// ---------------------------------------------------------------------------
+#if defined(ARDUINO)
+#include <pgmspace.h>
+#define TG_TEXT(s) PSTR(s)
+#else
+#define TG_TEXT(s) (s)
+#endif
+
 // ============================================================================
 //  Telegram - camada de TEXTO pura (sem Arduino, sem rede, sem alocacao)
 //
@@ -259,7 +279,7 @@ inline void formatLiters(float liters, char *out, size_t outSize) {
 
   char grouped[12];  // "999.999.999" + NUL
   formatGroupedLong(value, grouped, sizeof(grouped));
-  snprintf(out, outSize, "%s L", grouped);
+  snprintf(out, outSize, TG_TEXT("%s L"), grouped);
 }
 
 // Litros inteiros SEM unidade ("1.234"), para frases que ja dizem "litros".
@@ -299,7 +319,7 @@ struct TelegramStatusData {
 inline void formatMinMax(bool hasData, float minL, float maxL, char *out,
                          size_t outSize) {
   if (!hasData) {
-    snprintf(out, outSize, "Sem dados");
+    snprintf(out, outSize, TG_TEXT("Sem dados"));
     return;
   }
 
@@ -310,7 +330,7 @@ inline void formatMinMax(bool hasData, float minL, float maxL, char *out,
   char highText[12];
   formatGroupedLong(low, lowText, sizeof(lowText));
   formatGroupedLong(high, highText, sizeof(highText));
-  snprintf(out, outSize, "min %s L | max %s L", lowText, highText);
+  snprintf(out, outSize, TG_TEXT("min %s L | max %s L"), lowText, highText);
 }
 
 // Mensagem do /status: os sete grupos pedidos, nesta ordem, e nada mais.
@@ -321,7 +341,7 @@ inline void buildStatusMessage(const TelegramStatusData &data,
   if (data.hasVolume) {
     formatLiters(data.volumeL, volume, sizeof(volume));
   } else {
-    snprintf(volume, sizeof(volume), "Sem dados");
+    snprintf(volume, sizeof(volume), TG_TEXT("Sem dados"));
   }
 
   char today[40];
@@ -344,24 +364,24 @@ inline void buildStatusMessage(const TelegramStatusData &data,
   formatUptime(uptimeS, uptime, sizeof(uptime));
 
   snprintf(out, outSize,
-           "Reservatório\n"
-           "Volume atual: %s\n"
-           "Hoje: %s\n"
-           "Ontem: %s\n"
-           "Últimos 7 dias: %s\n"
-           "Últimos 30 dias: %s\n"
-           "Firmware: %s\n"
-           "Uptime: %s",
+           TG_TEXT("Reservatório\n"
+                   "Volume atual: %s\n"
+                   "Hoje: %s\n"
+                   "Ontem: %s\n"
+                   "Últimos 7 dias: %s\n"
+                   "Últimos 30 dias: %s\n"
+                   "Firmware: %s\n"
+                   "Uptime: %s"),
            volume, today, yesterday, last7, last30, version, uptime);
 }
 
 // Mensagem do /help: somente os comandos que existem nesta etapa.
 inline void buildHelpMessage(char *out, size_t outSize) {
   snprintf(out, outSize,
-           "Comandos disponíveis:\n"
-           "/help ou /h - lista de comandos disponíveis\n"
-           "/status ou /s - situação atual do reservatório\n"
-           "/warnings ou /w - limites e alertas de nível");
+           TG_TEXT("Comandos disponíveis:\n"
+                   "/help ou /h - lista de comandos disponíveis\n"
+                   "/status ou /s - situação atual do reservatório\n"
+                   "/warnings ou /w - limites e alertas de nível"));
 }
 
 // ---------------------------------------------------------------------------
@@ -376,9 +396,9 @@ inline void buildHelpMessage(char *out, size_t outSize) {
 inline void buildBootMessage(uint8_t bootReason, const char *version, char *out,
                              size_t outSize) {
   snprintf(out, outSize,
-           "MoniRes reiniciado.\n"
-           "Versão: %s\n"
-           "Motivo: %s",
+           TG_TEXT("MoniRes reiniciado.\n"
+                   "Versão: %s\n"
+                   "Motivo: %s"),
            version, bootReasonDescription(bootReason));
 }
 
@@ -389,12 +409,12 @@ inline void buildBootMessage(uint8_t bootReason, const char *version, char *out,
 inline const char *alertLevelName(alerts::Level level) {
   switch (level) {
     case alerts::Level::RISK:
-      return "Risco";
+      return TG_TEXT("Risco");
     case alerts::Level::CRITICAL:
-      return "Crítico";
+      return TG_TEXT("Crítico");
     case alerts::Level::NORMAL:
     default:
-      return "Normal";
+      return TG_TEXT("Normal");
   }
 }
 
@@ -402,18 +422,18 @@ inline const char *alertLevelName(alerts::Level level) {
 inline const char *warningsErrorText(alerts::ConfigError error) {
   switch (error) {
     case alerts::ConfigError::RISK_RANGE:
-      return "o risco deve ficar entre 1 e 100";
+      return TG_TEXT("o risco deve ficar entre 1 e 100");
     case alerts::ConfigError::CRITICAL_RANGE:
-      return "o crítico deve ficar entre 1 e 100";
+      return TG_TEXT("o crítico deve ficar entre 1 e 100");
     case alerts::ConfigError::HIST_RANGE:
-      return "a histerese deve ficar entre 1 e 100";
+      return TG_TEXT("a histerese deve ficar entre 1 e 100");
     case alerts::ConfigError::ORDER:
-      return "o crítico deve ser menor que o risco";
+      return TG_TEXT("o crítico deve ser menor que o risco");
     case alerts::ConfigError::HIST_OVERFLOW:
-      return "risco + histerese não pode passar de 100";
+      return TG_TEXT("risco + histerese não pode passar de 100");
     case alerts::ConfigError::OK:
     default:
-      return "limites válidos";
+      return TG_TEXT("limites válidos");
   }
 }
 
@@ -436,16 +456,18 @@ inline void buildWarningsLimits(alerts::Config cfg, alerts::Level level,
     char current[24];
     formatGroupedLong(static_cast<long>(volumeL + 0.5f), current,
                       sizeof(current));
-    snprintf(state, sizeof(state), "%s - %s L", alertLevelName(level), current);
+    snprintf(state, sizeof(state), TG_TEXT("%s - %s L"), alertLevelName(level),
+             current);
   } else {
-    snprintf(state, sizeof(state), "%s (sem leitura)", alertLevelName(level));
+    snprintf(state, sizeof(state), TG_TEXT("%s (sem leitura)"),
+             alertLevelName(level));
   }
 
   snprintf(out, outSize,
-           "Risco: %u%% = %s L\n"
-           "Crítico: %u%% = %s L\n"
-           "Histerese: %u pontos\n"
-           "Estado atual: %s",
+           TG_TEXT("Risco: %u%% = %s L\n"
+                   "Crítico: %u%% = %s L\n"
+                   "Histerese: %u pontos\n"
+                   "Estado atual: %s"),
            static_cast<unsigned>(cfg.riskPct), risk,
            static_cast<unsigned>(cfg.criticalPct), critical,
            static_cast<unsigned>(cfg.histPct), state);
@@ -463,9 +485,9 @@ inline void buildWarningsMessage(alerts::Config cfg, alerts::Level level,
                     reference, sizeof(reference));
 
   snprintf(out, outSize,
-           "Alertas de nível\n"
-           "Referência (100%%): %s L\n"
-           "%s",
+           TG_TEXT("Alertas de nível\n"
+                   "Referência (100%%): %s L\n"
+                   "%s"),
            reference, limits);
 }
 
@@ -476,16 +498,16 @@ inline void buildWarningsAppliedMessage(alerts::Config cfg, alerts::Level level,
   char limits[200];
   buildWarningsLimits(cfg, level, volumeL, hasVolume, limits, sizeof(limits));
 
-  snprintf(out, outSize, "Limites atualizados.\n%s", limits);
+  snprintf(out, outSize, TG_TEXT("Limites atualizados.\n%s"), limits);
 }
 
 // "/w ..." recusado: motivo + uso + limites vigentes (que NAO mudaram).
 inline void buildWarningsErrorMessage(const char *reason, alerts::Config cfg,
                                       char *out, size_t outSize) {
   snprintf(out, outSize,
-           "Limites não alterados: %s\n"
-           "Uso: /w lr lc hist (percentuais de 1 a 100)\n"
-           "Atuais: risco %u%%, crítico %u%%, histerese %u%%",
+           TG_TEXT("Limites não alterados: %s\n"
+                   "Uso: /w lr lc hist (percentuais de 1 a 100)\n"
+                   "Atuais: risco %u%%, crítico %u%%, histerese %u%%"),
            reason, static_cast<unsigned>(cfg.riskPct),
            static_cast<unsigned>(cfg.criticalPct),
            static_cast<unsigned>(cfg.histPct));
@@ -503,22 +525,22 @@ inline void buildAlertMessage(alerts::Event event, float volumeL, char *out,
   switch (event) {
     case alerts::Event::RISK_ENTERED:
       snprintf(out, outSize,
-               "Alerta: reservatório atingiu o nível de risco - %s litros",
+               TG_TEXT("Alerta: reservatório atingiu o nível de risco - %s litros"),
                liters);
       break;
     case alerts::Event::CRITICAL_ENTERED:
       snprintf(out, outSize,
-               "Alerta: reservatório atingiu o nível crítico - %s litros",
+               TG_TEXT("Alerta: reservatório atingiu o nível crítico - %s litros"),
                liters);
       break;
     case alerts::Event::CRITICAL_RECOVERED:
       snprintf(out, outSize,
-               "Reservatório recuperou-se do nível crítico - %s litros",
+               TG_TEXT("Reservatório recuperou-se do nível crítico - %s litros"),
                liters);
       break;
     case alerts::Event::RISK_RECOVERED:
       snprintf(out, outSize,
-               "Reservatório recuperou-se do nível de risco - %s litros",
+               TG_TEXT("Reservatório recuperou-se do nível de risco - %s litros"),
                liters);
       break;
     case alerts::Event::NONE:

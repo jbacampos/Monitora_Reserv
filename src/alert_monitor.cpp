@@ -26,28 +26,28 @@ alerts::Config defaultConfig() {
 const char *levelName(alerts::Level level) {
   switch (level) {
     case alerts::Level::RISK:
-      return "Risco";
+      return PSTR("Risco");
     case alerts::Level::CRITICAL:
-      return "Critico";
+      return PSTR("Critico");
     case alerts::Level::NORMAL:
     default:
-      return "Normal";
+      return PSTR("Normal");
   }
 }
 
 const char *eventName(alerts::Event event) {
   switch (event) {
     case alerts::Event::RISK_ENTERED:
-      return "nivel de risco";
+      return PSTR("nivel de risco");
     case alerts::Event::CRITICAL_ENTERED:
-      return "nivel critico";
+      return PSTR("nivel critico");
     case alerts::Event::CRITICAL_RECOVERED:
-      return "recuperado do critico";
+      return PSTR("recuperado do critico");
     case alerts::Event::RISK_RECOVERED:
-      return "recuperado do risco";
+      return PSTR("recuperado do risco");
     case alerts::Event::NONE:
     default:
-      return "?";
+      return PSTR("?");
   }
 }
 
@@ -69,8 +69,8 @@ void AlertMonitor::load() {
     if (!m_fsWarned) {
       m_fsWarned = true;
       Serial.println(
-          "Alertas: LittleFS indisponivel; limites e estado em RAM ate o "
-          "proximo reboot.");
+          PSTR("Alertas: LittleFS indisponivel; limites e estado em RAM ate o "
+               "proximo reboot."));
     }
     return;
   }
@@ -86,7 +86,8 @@ void AlertMonitor::load() {
     }
     alerts::Persisted decoded;
     if (!alerts::decodeRecord(raw, decoded)) {
-      Serial.printf("Alertas: %s invalido (CRC/versao); ignorado.\n", paths[i]);
+      Serial.printf(PSTR("Alertas: %s invalido (CRC/versao); ignorado.\n"),
+                    paths[i]);
       continue;
     }
     if (!found || decoded.generation >= chosen.generation) {
@@ -98,8 +99,8 @@ void AlertMonitor::load() {
 
   if (!found) {
     Serial.printf(
-        "Alertas: sem registro valido; usando risco=%u%%, critico=%u%%, "
-        "histerese=%u%%\n",
+        PSTR("Alertas: sem registro valido; usando risco=%u%%, critico=%u%%, "
+             "histerese=%u%%\n"),
         static_cast<unsigned>(m_state.config.riskPct),
         static_cast<unsigned>(m_state.config.criticalPct),
         static_cast<unsigned>(m_state.config.histPct));
@@ -109,8 +110,8 @@ void AlertMonitor::load() {
   m_state = chosen;
   m_persisted = true;
   Serial.printf(
-      "[%7.2f s] Alertas: limites carregados (risco=%u%%, critico=%u%%, "
-      "histerese=%u%%, estado=%s, pendentes=%u, geracao=%lu)\n",
+      PSTR("[%7.2f s] Alertas: limites carregados (risco=%u%%, critico=%u%%, "
+           "histerese=%u%%, estado=%s, pendentes=%u, geracao=%lu)\n"),
       static_cast<double>(m_bootMs) / 1000.0,
       static_cast<unsigned>(m_state.config.riskPct),
       static_cast<unsigned>(m_state.config.criticalPct),
@@ -135,7 +136,7 @@ void AlertMonitor::store() {
     m_persisted = false;
     if (!m_fsWarned) {
       m_fsWarned = true;
-      Serial.println("Alertas: sem LittleFS; estado nao sera preservado.");
+      Serial.println(PSTR("Alertas: sem LittleFS; estado nao sera preservado."));
     }
     return;
   }
@@ -147,15 +148,15 @@ void AlertMonitor::store() {
   const char *path = (m_activeSlot == 0) ? ALERT_FILE_B : ALERT_FILE_A;
   File file = LittleFS.open(path, "w");
   if (!file) {
-    Serial.printf("Alertas: falha ao gravar %s; slot anterior preservado.\n",
+    Serial.printf(PSTR("Alertas: falha ao gravar %s; slot anterior preservado.\n"),
                   path);
     return;
   }
   const size_t written = file.write(raw, sizeof(raw));
   file.close();
   if (written != sizeof(raw)) {
-    Serial.printf("Alertas: gravacao parcial em %s (%u/%u B); ignorada.\n", path,
-                  static_cast<unsigned>(written),
+    Serial.printf(PSTR("Alertas: gravacao parcial em %s (%u/%u B); ignorada.\n"),
+                  path, static_cast<unsigned>(written),
                   static_cast<unsigned>(sizeof(raw)));
     return;
   }
@@ -192,10 +193,10 @@ void AlertMonitor::update(uint32_t nowMs, float volumeL, bool sampleValid) {
       // importa mais, entao o mais antigo e descartado.
       alerts::popPending(m_state);
       alerts::pushPending(m_state, event, volumeL);
-      Serial.println("Alertas: fila cheia; alerta mais antigo descartado.");
+      Serial.println(PSTR("Alertas: fila cheia; alerta mais antigo descartado."));
     }
 
-    Serial.printf("[%7.2f s] Alertas: %s (%.1f L)\n",
+    Serial.printf(PSTR("[%7.2f s] Alertas: %s (%.1f L)\n"),
                   static_cast<double>(nowMs) / 1000.0, eventName(event),
                   static_cast<double>(volumeL));
   }
@@ -210,7 +211,7 @@ alerts::ConfigError AlertMonitor::applyConfig(const alerts::Config &cfg,
   const alerts::ConfigError error = alerts::validate(cfg);
   if (error != alerts::ConfigError::OK) {
     Serial.printf(
-        "[%7.2f s] Alertas: limites recusados (erro=%u); atuais mantidos.\n",
+        PSTR("[%7.2f s] Alertas: limites recusados (erro=%u); atuais mantidos.\n"),
         static_cast<double>(millis()) / 1000.0, static_cast<unsigned>(error));
     return error;
   }
@@ -231,15 +232,15 @@ alerts::ConfigError AlertMonitor::applyConfig(const alerts::Config &cfg,
 
   store();
 
+  const char *result = changed ? PSTR("atualizados") : PSTR("reconfirmados");
+  const char *persisted = m_persisted ? PSTR("") : PSTR(" [nao persistido]");
   Serial.printf(
-      "[%7.2f s] Alertas: limites %s (risco=%u%%, critico=%u%%, histerese=%u%%, "
-      "estado=%s)%s\n",
-      static_cast<double>(millis()) / 1000.0,
-      changed ? "atualizados" : "reconfirmados",
+      PSTR("[%7.2f s] Alertas: limites %s (risco=%u%%, critico=%u%%, "
+           "histerese=%u%%, estado=%s)%s\n"),
+      static_cast<double>(millis()) / 1000.0, result,
       static_cast<unsigned>(cfg.riskPct),
       static_cast<unsigned>(cfg.criticalPct),
-      static_cast<unsigned>(cfg.histPct), levelName(m_state.level),
-      m_persisted ? "" : " [nao persistido]");
+      static_cast<unsigned>(cfg.histPct), levelName(m_state.level), persisted);
   return alerts::ConfigError::OK;
 }
 

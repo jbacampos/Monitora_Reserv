@@ -84,6 +84,7 @@ CFG = read_constants(
         "FIRMWARE_VERSION",
         "TELEGRAM_PORT",
         "TELEGRAM_POLL_INTERVAL_MS",
+        "TELEGRAM_FIRST_POLL_DELAY_MS",
         "TELEGRAM_DNS_TIMEOUT_MS",
         "TELEGRAM_SOCKET_TIMEOUT_MS",
         "TELEGRAM_RESPONSE_TIMEOUT_MS",
@@ -1162,6 +1163,48 @@ def test_invariants():
         check(result == expected, "%s -> %u ms" % (label, result))
     check(silence_ms(60270, 61700, 270, True) < CFG["STALL_GUARD_FIRST_WARN_MS"],
           "o caso de campo nao dispara aviso nem reboot")
+
+    print("\n19b. Heap: literais na FLASH e ordem do boot (Telegram antes do MQTT)")
+    text_code = strip_comments(read_text(TEXT_HEADER))
+    monitor_cpp = strip_comments(read_text(ALERT_MONITOR_CPP))
+    # No ESP8266 o .rodata vive na DRAM (linker script do core): cada byte de
+    # texto custa 1 byte de heap. PSTR() move o literal para ".irom0.pstr.*"
+    # (flash). Medido: .rodata caiu 2 948 B com esta conversao - era o que
+    # fechava o gate de heap do Telegram (14 080 B) e deixava o bot mudo.
+    check("#define TG_TEXT(s) PSTR(s)" in text_code,
+          "TG_TEXT mapeia os literais das mensagens para a flash (PSTR)")
+    check(text_code.count("TG_TEXT(") >= 12,
+          "todas as mensagens usam TG_TEXT() (%d ocorrencias)" % text_code.count("TG_TEXT("))
+    check('TG_TEXT("MoniRes reiniciado.' in text_code and
+          'TG_TEXT("Comandos disponíveis:' in text_code and
+          'TG_TEXT("Reservatório\\n"' in text_code,
+          "aviso de boot, /help e /status vem da flash")
+    check(text_code.count("Reservatório recuperou-se do nível") == 2 and
+          text_code.count("reservatório atingiu o nível") == 2,
+          "as quatro mensagens de alerta continuam identicas (dentro de TG_TEXT)")
+    check('"/help"' in text_code and '"/status"' in text_code and
+          '"/warnings"' in text_code,
+          "os literais de comando continuam no header")
+    check("PSTR(" in telegram and "PSTR(" in monitor_cpp and "PSTR(" in main_cpp,
+          "os formatos de log dos tres arquivos tambem vao para a flash")
+
+    check(CFG["TELEGRAM_FIRST_POLL_DELAY_MS"] == 1000 and
+          CFG["TELEGRAM_FIRST_POLL_DELAY_MS"] < CFG["TELEGRAM_POLL_INTERVAL_MS"],
+          "primeira consulta 1 s apos o boot (antes do intervalo de 20 s)")
+    check("TELEGRAM_FIRST_POLL_DELAY_MS" in telegram,
+          "o modulo usa o atraso da primeira consulta")
+    check("nowMs - (TELEGRAM_POLL_INTERVAL_MS - TELEGRAM_FIRST_POLL_DELAY_MS)"
+          in telegram,
+          "primeira consulta agendada logo apos o boot (conta wrap-safe)")
+    check("if (!device_clock::synced())" in telegram,
+          "consulta ESPERA o NTP (sem relogio o BearSSL recusa a cadeia)")
+    # A ordem no loop e o que garante a sessao TLS criada com o heap inteiro.
+    tg_at = main_cpp.find("g_telegram.update(now, telegramContext);")
+    tb_at = main_cpp.find("g_tb.update(now, sample);")
+    check(tg_at != -1 and tb_at != -1 and tg_at < tb_at,
+          "Telegram ANTES do ThingsBoard no loop (sessao nasce com o heap inteiro)")
+    check("alertas=%s(%u)" in main_cpp,
+          "a linha periodica mostra o estado e a fila dos alertas")
 
 
 def test_http_helpers():

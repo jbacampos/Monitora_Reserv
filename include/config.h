@@ -315,6 +315,19 @@ constexpr uint16_t TELEGRAM_PORT  = 443;
 // garante que nunca existam duas consultas simultaneas).
 constexpr uint32_t TELEGRAM_POLL_INTERVAL_MS = 20000UL;
 
+// Atraso da PRIMEIRA consulta depois do boot (as seguintes respeitam
+// TELEGRAM_POLL_INTERVAL_MS). A sessao TLS precisa nascer com o HEAP INTEIRO,
+// ANTES de o MQTT reservar os ~3,4 KB do TLS dele: com o MQTT ja conectado o
+// heap livre cai para ~12,8 KB e o gate (TELEGRAM_MIN_FREE_HEAP, 14,08 KB)
+// NUNCA abre. Medido em campo em 2026-11-20: o bot ficou mudo, o aviso de boot
+// e os alertas presos na fila, com `tg=adiado(12336B)` a cada 5 s no log.
+// A consulta so sai quando Wi-Fi E relogio (NTP) estiverem prontos - ver o
+// guarda de relogio em Telegram::update(). Depois de criada, a sessao e
+// REAPROVEITADA e o gate deixa de ser consultado (sessionReady()).
+constexpr uint32_t TELEGRAM_FIRST_POLL_DELAY_MS = 1000UL;
+static_assert(TELEGRAM_FIRST_POLL_DELAY_MS < TELEGRAM_POLL_INTERVAL_MS,
+              "a primeira consulta precisa vir antes do intervalo normal");
+
 // Limites de tempo de UMA consulta, incluindo DNS, handshake TLS e leitura da
 // resposta HTTP. O core do ESP8266 faz o DNS do connect com timeout fixo de
 // 10 s; por isso o nome e resolvido ANTES com WiFi.hostByName(), limitado a
