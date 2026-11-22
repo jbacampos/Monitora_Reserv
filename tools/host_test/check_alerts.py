@@ -121,11 +121,11 @@ NORMAL, RISK, CRITICAL = 0, 1, 2
 NONE = 0
 RISK_ENTERED, CRITICAL_ENTERED, CRITICAL_RECOVERED, RISK_RECOVERED = 1, 2, 3, 4
 
-LEVEL_NAME = {NORMAL: "Normal", RISK: "Risco", CRITICAL: "Critico"}
-EVENT_NAME = {NONE: "nada", RISK_ENTERED: "atingiu o risco",
+LEVEL_NAME = {NORMAL: "Normal", RISK: "Atenção", CRITICAL: "Critico"}
+EVENT_NAME = {NONE: "nada", RISK_ENTERED: "atingiu a atenção",
               CRITICAL_ENTERED: "atingiu o critico",
               CRITICAL_RECOVERED: "recuperou do critico",
-              RISK_RECOVERED: "recuperou do risco"}
+              RISK_RECOVERED: "recuperou da atenção"}
 
 
 def encode_record(state, generation):
@@ -429,7 +429,7 @@ def main():
     bad_cfg[5], bad_cfg[6] = DEFAULT_CFG["critical"], DEFAULT_CFG["risk"]
     bad_cfg[28:32] = struct.pack("<I", crc32(bad_cfg[0:28]))
     check(decode_record(bytes(bad_cfg)) is None,
-          "critico >= risco no registro e recusado")
+          "critico >= atenção no registro e recusado")
     check(decode_record(None) is None and decode_record(b"\x00" * 8) is None,
           "arquivo ausente ou curto e recusado")
 
@@ -508,17 +508,17 @@ def main():
     check(reborn.peek() == (CRITICAL_RECOVERED, 41000.0),
           "mensagem de recuperacao ainda nao enviada sobrevive ao reboot")
     reborn.confirm()
-    # O tanque ja tinha subido acima de risco+hist ENQUANTO o aparelho reiniciava:
+    # O tanque ja tinha subido acima de atenção+hist ENQUANTO o aparelho reiniciava:
     # a travessia nao foi observada, entao o reboot rebaselina em silencio (secao
     # 8). A recuperacao AO VIVO - a que interessa - vem logo abaixo.
     check(reborn.update(SETTLE_MS + 3000, 80000.0) == [] and
           reborn.state["level"] == NORMAL,
           "reboot + tanque cheio: recuperacao nao observada nao gera mensagem")
     check(reborn.update(SETTLE_MS + 4000, 50000.0) == [RISK_ENTERED],
-          "queda ao vivo volta a entrar no risco")
+          "queda ao vivo volta a entrar na atenção")
     reborn.confirm()
     check(reborn.update(SETTLE_MS + 5000, 80000.0) == [RISK_RECOVERED],
-          "acima de risco+hist recupera o risco (ao vivo)")
+          "acima de atenção+hist recupera a atenção (ao vivo)")
     reborn.confirm()
     check(reborn.state["level"] == NORMAL, "estado volta a NORMAL")
 
@@ -614,7 +614,7 @@ def main():
               "persistido %s -> %.0f L: silencioso, estado %s"
               % (LEVEL_NAME[persisted], volume, LEVEL_NAME[expected]))
 
-    # PIORA: um UNICO alerta (o degrau direto nao duplica o de risco) com o volume
+    # PIORA: um UNICO alerta (o degrau direto nao duplica o de atenção) com o nivel
     # de AGORA, que e a informacao util para quem le.
     for persisted, volume, event, expected in (
             (NORMAL, critical_liters, CRITICAL_ENTERED, CRITICAL),
@@ -723,7 +723,7 @@ def main():
 
     # Margens: sem elas o cenario nao exercita entrada E recuperacao.
     check(cycle_liters(0) >= recover_risk(DEFAULT_CFG),
-          "comeca em %.0f L, acima da recuperacao do risco (%.0f L)"
+          "comeca em %.0f L, acima da recuperacao da atenção (%.0f L)"
           % (cycle_liters(0), recover_risk(DEFAULT_CFG)))
     check(cycle_liters(drain_ms) <= enter_critical(DEFAULT_CFG),
           "desce a %.0f L, abaixo da entrada do critico (%.0f L)"

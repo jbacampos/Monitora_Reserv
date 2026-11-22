@@ -689,11 +689,18 @@ bool isAuthorizedChat(int64_t chatId) {
 namespace {
 
 // Extrai do historico SOMENTE o que a mensagem mostra. Nenhum agregado e
-// recalculado: dayReport() e closedPeriodReport() ja devolvem min/max.
+// recalculado: dayReport() e closedPeriodReport() ja devolvem min/max. O estado
+// de AGORA vem do mesmo levelForVolume() do aviso de boot.
 void buildStatusData(const TelegramContext &context, TelegramStatusData &data) {
   data = TelegramStatusData();
   data.hasVolume = context.sampleValid;
   data.volumeL = context.volumeL;
+  data.hasRate = context.hasRate;
+  data.rateLph = context.rateLph;
+  if (context.sampleValid && context.alerts != nullptr) {
+    data.hasLevel = true;
+    data.level = context.alerts->levelForVolume(context.volumeL);
+  }
 
   const History *history = context.history;
   if (history == nullptr) {
@@ -999,7 +1006,7 @@ void Telegram::update(uint32_t nowMs, const TelegramContext &context) {
 
   // Alertas de nivel: no maximo UM por consulta, pela mesma sessao (e antes de
   // a consulta usa-la). O evento ja foi enfileirado por AlertMonitor::update().
-  flushPendingAlerts(nowMs, context.alerts);
+  flushPendingAlerts(nowMs, context);
 
   // DIAG: heap no inicio e no fim do poll. Fica aqui (ponto unico) para cobrir
   // todos os caminhos de saida de pollOnce().
@@ -1082,8 +1089,12 @@ void Telegram::sendBootNotice(uint32_t nowMs, const TelegramContext &context) {
 //  com falha de envio o alerta PERMANECE na fila persistida e a consulta
 //  seguinte tenta de novo.
 // ---------------------------------------------------------------------------
-void Telegram::flushPendingAlerts(uint32_t nowMs, AlertMonitor *alerts) {
-  if (alerts == nullptr || !alerts->peekPending(g_message, sizeof(g_message))) {
+void Telegram::flushPendingAlerts(uint32_t nowMs,
+                                  const TelegramContext &context) {
+  AlertMonitor *alerts = context.alerts;
+  if (alerts == nullptr ||
+      !alerts->peekPending(context.rateLph, context.hasRate, g_message,
+                           sizeof(g_message))) {
     return;
   }
 
@@ -1397,7 +1408,8 @@ void Telegram::answerCommand(TgCommand command, const TelegramContext &context,
 // POST sendMessage com o corpo application/x-www-form-urlencoded montado em
 // g_form (chat_id + texto codificado). A resposta e pequena e cabe em g_body.
 bool Telegram::sendMessage(int64_t chatId, const char *text) {
-  const int prefix = snprintf(g_form, sizeof(g_form), "chat_id=%lld&text=",
+  const int prefix = snprintf(g_form, sizeof(g_form),
+                              "chat_id=%lld&parse_mode=HTML&text=",
                               static_cast<long long>(chatId));
   if (prefix <= 0 || static_cast<size_t>(prefix) >= sizeof(g_form)) {
     return false;

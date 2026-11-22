@@ -9,8 +9,10 @@
 #include "moving_average.h"
 #include "sensor.h"
 #include "simulator.h"
+#include "rate.h"
 #include "stall_guard.h"
 #include "telegram.h"
+#include "telegram_text.h"
 #include "thingsboard.h"
 #include "uptime.h"
 #include "volume.h"
@@ -36,6 +38,9 @@ ThingsBoard g_tb;
 History g_history;
 Telegram g_telegram;
 AlertMonitor g_alerts;
+
+// Serie curta da taxa recente (1 h). So RAM: some no reboot, de proposito.
+rate::Ring g_rate;
 
 // Uptime acumulado (imune ao rollover de millis()) e a ultima medicao.
 UptimeCounter g_uptime;
@@ -116,6 +121,13 @@ void printDiagnostics(uint32_t nowMs) {
   Serial.printf(PSTR(" | alertas=%s(%u)"), g_alerts.levelText(),
                 static_cast<unsigned>(g_alerts.pendingCount()));
 
+  // Taxa recente: MESMO formato das mensagens (uma unica fonte de texto). E por
+  // este log que se decide se RATE_WINDOW_MS esta adequado a producao.
+  char rateText[24];
+  formatRate(rate::litersPerHour(g_rate), rate::hasRate(g_rate), rateText,
+             sizeof(rateText));
+  Serial.printf(PSTR(" | taxa=%s"), rateText);
+
   Serial.println();
 }
 
@@ -156,7 +168,7 @@ void printStartup() {
 
   // Alertas: os defaults ficam em config.h; os limites EFETIVOS podem ter sido
   // trocados por /w e sao carregados do LittleFS em g_alerts.begin().
-  Serial.printf(PSTR("Alertas: risco %u%% | critico %u%% | histerese %u%% | "
+  Serial.printf(PSTR("Alertas: atenção %u%% | critico %u%% | histerese %u%% | "
                      "ref. 100%% = %lu L | settle %lu s\n"),
                 static_cast<unsigned>(ALERT_DEFAULT_RISK_PCT),
                 static_cast<unsigned>(ALERT_DEFAULT_CRITICAL_PCT),
@@ -193,6 +205,7 @@ void setup() {
 
   // Historico depois do ThingsBoard: reutiliza o LittleFS ja montado pela fila.
   g_history.begin(now);
+  rate::begin(g_rate, now);
 
   // Alertas de nivel: mesmos LittleFS e mesmo volume filtrado do resto.
   g_alerts.begin(now);
@@ -242,6 +255,10 @@ void loop() {
   g_history.update(now, device_clock::synced(), g_lastSampleTimestampMs,
                    g_filteredLiters, g_hasSample);
 
+  // Taxa recente (1 h em RAM): usa a MESMA media movel de todo o resto. Vem
+  // antes dos alertas e da consulta para o indicador sair no mesmo passo.
+  rate::update(g_rate, now, g_filteredLiters, g_hasSample);
+
   // Alertas de nivel: avalia o volume FILTRADO e enfileira no maximo um evento
   // por passo. Vem ANTES do Telegram para o alerta sair na mesma consulta.
   g_alerts.update(now, g_filteredLiters, g_hasSample);
@@ -258,6 +275,8 @@ void loop() {
   telegramContext.volumeL = g_filteredLiters;
   telegramContext.uptimeS = g_uptime.seconds();
   telegramContext.sampleValid = g_hasSample;
+  telegramContext.rateLph = rate::litersPerHour(g_rate);
+  telegramContext.hasRate = rate::hasRate(g_rate);
   telegramContext.history = &g_history;
   telegramContext.alerts = &g_alerts;
   g_telegram.update(now, telegramContext);

@@ -26,7 +26,7 @@ alerts::Config defaultConfig() {
 const char *levelName(alerts::Level level) {
   switch (level) {
     case alerts::Level::RISK:
-      return PSTR("Risco");
+      return PSTR("Atenção");
     case alerts::Level::CRITICAL:
       return PSTR("Critico");
     case alerts::Level::NORMAL:
@@ -38,13 +38,13 @@ const char *levelName(alerts::Level level) {
 const char *eventName(alerts::Event event) {
   switch (event) {
     case alerts::Event::RISK_ENTERED:
-      return PSTR("nivel de risco");
+      return PSTR("nivel de atencao");
     case alerts::Event::CRITICAL_ENTERED:
       return PSTR("nivel critico");
     case alerts::Event::CRITICAL_RECOVERED:
       return PSTR("recuperado do critico");
     case alerts::Event::RISK_RECOVERED:
-      return PSTR("recuperado do risco");
+      return PSTR("recuperado da atencao");
     case alerts::Event::NONE:
     default:
       return PSTR("?");
@@ -100,7 +100,7 @@ void AlertMonitor::load() {
 
   if (!found) {
     Serial.printf(
-        PSTR("Alertas: sem registro valido; usando risco=%u%%, critico=%u%%, "
+        PSTR("Alertas: sem registro valido; usando atenção=%u%%, critico=%u%%, "
              "histerese=%u%%\n"),
         static_cast<unsigned>(m_state.config.riskPct),
         static_cast<unsigned>(m_state.config.criticalPct),
@@ -111,7 +111,7 @@ void AlertMonitor::load() {
   m_state = chosen;
   m_persisted = true;
   Serial.printf(
-      PSTR("[%7.2f s] Alertas: limites carregados (risco=%u%%, critico=%u%%, "
+      PSTR("[%7.2f s] Alertas: limites carregados (atenção=%u%%, critico=%u%%, "
            "histerese=%u%%, estado=%s, pendentes=%u, geracao=%lu)\n"),
       static_cast<double>(m_bootMs) / 1000.0,
       static_cast<unsigned>(m_state.config.riskPct),
@@ -207,7 +207,7 @@ void AlertMonitor::update(uint32_t nowMs, float volumeL, bool sampleValid) {
 
   bool changed = false;
   // Esvazia transicoes em CADEIA no mesmo passo (ex.: recuperou do critico e,
-  // logo, do risco). No maximo MAX_PENDING eventos por avaliacao.
+  // logo, da atenção). No maximo MAX_PENDING eventos por avaliacao.
   for (uint8_t i = 0; i < alerts::MAX_PENDING; ++i) {
     const alerts::Event event =
         alerts::step(m_state.level, m_state.config, volumeL);
@@ -269,7 +269,7 @@ alerts::ConfigError AlertMonitor::applyConfig(const alerts::Config &cfg,
   const char *result = changed ? PSTR("atualizados") : PSTR("reconfirmados");
   const char *persisted = m_persisted ? PSTR("") : PSTR(" [nao persistido]");
   Serial.printf(
-      PSTR("[%7.2f s] Alertas: limites %s (risco=%u%%, critico=%u%%, "
+      PSTR("[%7.2f s] Alertas: limites %s (atenção=%u%%, critico=%u%%, "
            "histerese=%u%%, estado=%s)%s\n"),
       static_cast<double>(millis()) / 1000.0, result,
       static_cast<unsigned>(cfg.riskPct),
@@ -278,12 +278,13 @@ alerts::ConfigError AlertMonitor::applyConfig(const alerts::Config &cfg,
   return alerts::ConfigError::OK;
 }
 
-bool AlertMonitor::peekPending(char *out, size_t cap) const {
+bool AlertMonitor::peekPending(float rateLph, bool hasRate, char *out,
+                               size_t cap) const {
   if (out == nullptr || cap == 0 || m_state.pendingCount == 0) {
     return false;
   }
-  buildAlertMessage(m_state.pendingEvent[0], m_state.pendingVolumeL[0], out,
-                    cap);
+  buildAlertMessage(m_state.pendingEvent[0], m_state.pendingVolumeL[0], rateLph,
+                    hasRate, out, cap);
   return out[0] != '\0';
 }
 

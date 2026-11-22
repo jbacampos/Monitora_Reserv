@@ -33,7 +33,7 @@ struct Config {
   uint8_t histPct = 0;
 };
 
-// Estado do nivel. NORMAL = acima do risco; RISK = entre risco e critico;
+// Estado do nivel. NORMAL = acima da atenção; RISK = entre atenção e critico;
 // CRITICAL = no critico. Persistido para nao reenviar alertas a cada boot.
 enum class Level : uint8_t {
   NORMAL = 0,
@@ -55,7 +55,7 @@ enum class ConfigError : uint8_t {
   CRITICAL_RANGE,  // criticalPct fora de 1..100
   HIST_RANGE,      // histPct fora de 1..100
   ORDER,           // criticalPct >= riskPct
-  HIST_OVERFLOW,   // riskPct + histPct > 100 (o risco nunca recuperaria)
+  HIST_OVERFLOW,   // riskPct + histPct > 100 (a atenção nunca recuperaria)
 };
 
 // ---------------------------------------------------------------------------
@@ -115,11 +115,11 @@ inline bool sameConfig(const Config &a, const Config &b) {
 //  Maquina de estados
 // ---------------------------------------------------------------------------
 // Aplica UMA transicao e devolve o evento correspondente (NONE se nada mudou).
-// A ordem de avaliacao e critico -> risco, o que cobre um salto que cruze as
+// A ordem de avaliacao e critico -> atenção, o que cobre um salto que cruze as
 // duas recuperacoes: a chamada seguinte completa a segunda transicao.
 //
 // Degrau direto de NORMAL para abaixo do critico emite APENAS o alerta critico
-// (o de risco seria redundante: o nivel esta pior que o risco).
+// (o de atenção seria redundante: o nivel esta pior que a atenção).
 inline Event step(Level &level, const Config &cfg, float volumeL) {
   if (level == Level::CRITICAL) {
     if (volumeL >= recoverCriticalLiters(cfg)) {

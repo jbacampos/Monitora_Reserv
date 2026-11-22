@@ -45,6 +45,11 @@ struct TelegramContext {
   // millis() e nao e hora civil.
   uint32_t uptimeS = 0;
   bool sampleValid = false;
+  // Taxa de variacao recente (include/rate.h), em litros por hora, derivada da
+  // MESMA media movel do volume. `hasRate` e falso enquanto a janela nao tem
+  // base (ou depois de um reboot, quando a serie em RAM comeca do zero).
+  float rateLph = 0.0f;
+  bool hasRate = false;
   // Fonte dos agregados do /status. Nao ha segunda fonte de historico.
   const History *history = nullptr;
   // Alertas de nivel: o /w le e escreve os limites e o modulo Telegram entrega
@@ -94,7 +99,7 @@ class Telegram {
   // pouco antes da consulta (a mesma sessao serve as duas coisas). Sem pendencia
   // - ou sem conseguir abrir a sessao - nao faz nada: o alerta continua na fila
   // (persistida) e a proxima consulta tenta de novo.
-  void flushPendingAlerts(uint32_t nowMs, AlertMonitor *alerts);
+  void flushPendingAlerts(uint32_t nowMs, const TelegramContext &context);
 
   bool m_enabled = false;
   bool m_firstPoll = true;

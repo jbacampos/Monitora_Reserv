@@ -39,7 +39,7 @@ class AlertMonitor {
   alerts::Level levelForVolume(float volumeL) const {
     return alerts::levelFor(m_state.config, volumeL);
   }
-  // Estado em texto ("Normal"/"Risco"/"Critico") para o log serial.
+  // Estado em texto ("Normal"/"Atenção"/"Critico") para o log serial.
   const char *levelText() const;
   uint8_t pendingCount() const { return m_state.pendingCount; }
   uint32_t events() const { return m_events; }
@@ -50,8 +50,10 @@ class AlertMonitor {
   alerts::ConfigError applyConfig(const alerts::Config &cfg, float volumeL,
                                   bool sampleValid);
 
-  // Proxima mensagem a enviar (a mais antiga). false = nada pendente.
-  bool peekPending(char *out, size_t cap) const;
+  // Proxima mensagem a enviar (a mais antiga). false = nada pendente. A taxa
+  // recente (include/rate.h) entra na mensagem quando o chamador a tem; sem base
+  // (ou sem leitura) a linha da taxa simplesmente nao aparece.
+  bool peekPending(float rateLph, bool hasRate, char *out, size_t cap) const;
   // Confirma o envio da mensagem devolvida por peekPending() e persiste.
   void confirmPending();
 

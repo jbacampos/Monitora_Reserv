@@ -47,6 +47,7 @@ SECRETS_EXAMPLE = os.path.join(ROOT, "include", "secrets.h.example")
 THINGSBOARD_CPP = os.path.join(ROOT, "src", "thingsboard.cpp")
 ALERTS_HEADER = os.path.join(ROOT, "include", "alerts.h")
 VOLUME_HEADER = os.path.join(ROOT, "include", "volume.h")
+RATE_HEADER = os.path.join(ROOT, "include", "rate.h")
 ALERT_MONITOR_CPP = os.path.join(ROOT, "src", "alert_monitor.cpp")
 
 FAILURES = []
@@ -150,6 +151,12 @@ VOL = read_float_constants(
 )
 
 
+# Constante da taxa recente (include/rate.h, header PURO): a banda em que o
+# indicador diz "estável" - abaixo dela o que existe e o piso do ADC.
+RATE_STABLE_LPH = read_float_constants(
+    RATE_HEADER, ["RATE_STABLE_LPH"])["RATE_STABLE_LPH"]
+
+
 def mirrors_calibration():
     """Espelho de volume.h: sensor -> nivel -> litros."""
     sensor_mm = VOL["kSensorFullScaleMm"] * (VOL["kAdcReferenceV"] / VOL["kSensorFullScaleV"])
@@ -172,6 +179,10 @@ with open(TELEGRAM_CPP, "r", encoding="utf-8") as _handle:
     _tg_cpp = _handle.read()
 _m = re.search(r"char g_form\[([0-9]+)\];", _tg_cpp)
 FORM_CAPACITY = int(_m.group(1)) if _m else 640
+
+# Prefixo do corpo do POST, espelho de sendMessage(): o parse_mode=HTML viaja
+# junto com o chat_id (o texto codificado vem logo depois).
+POST_PREFIX = "chat_id=-1001234567890&parse_mode=HTML&text="
 
 
 # ---------------------------------------------------------------------------
@@ -244,46 +255,88 @@ def format_grouped(value):
     return ("-" if value < 0 else "") + grouped
 
 
-def format_liters(liters):
-    value = int(liters + 0.5) if liters >= 0 else int(liters - 0.5)
-    return "%s L" % format_grouped(value)
-
-
 def format_liters_bare(liters):
     value = int(liters + 0.5) if liters >= 0 else int(liters - 0.5)
     return format_grouped(value)
 
 
-def format_min_max(has_data, minimum, maximum):
-    if not has_data:
-        return "Sem dados"
-    low = int(minimum + 0.5) if minimum >= 0 else int(minimum - 0.5)
-    high = int(maximum + 0.5) if maximum >= 0 else int(maximum - 0.5)
-    return "min %s L | max %s L" % (format_grouped(low), format_grouped(high))
+def keycap_liters(grouped):
+    """'103.587' -> '1️⃣0️⃣3️⃣.5️⃣8️⃣7️⃣' (digito + U+FE0F + U+20E3)."""
+    return "".join("%s\ufe0f\u20e3" % char if char.isdigit() else char
+                   for char in grouped)
+
+
+def format_liters_keycap(liters):
+    """Espelho de formatLitersKeycap: litros em digitos-emoji, sem unidade."""
+    return keycap_liters(format_liters_bare(liters))
+
+
+def format_rate(liters_per_hour, has_rate):
+    """Espelho de formatRate(): seta + L/h, 'estável' ou 'sem base'."""
+    if not has_rate:
+        return "sem base"
+    if -RATE_STABLE_LPH < liters_per_hour < RATE_STABLE_LPH:
+        return "→ estável"
+    magnitude = abs(liters_per_hour)
+    rounded = int(magnitude / 10.0 + 0.5) * 10
+    arrow = "↑" if liters_per_hour > 0 else "↓"
+    return "%s %s L/h" % (arrow, format_grouped(rounded))
+
+
+def status_row(label, has_data, minimum, maximum):
+    """Uma linha da tabela: rotulo a esquerda, valores a direita ('-' sem dados)."""
+    if has_data:
+        low = format_grouped(int(minimum + 0.5) if minimum >= 0
+                             else int(minimum - 0.5))
+        high = format_grouped(int(maximum + 0.5) if maximum >= 0
+                              else int(maximum - 0.5))
+    else:
+        low = high = "-"
+    return "%-7s|%7s|%7s|" % (label, low, high)
+
+
+def build_status_table(data):
+    """Espelho de formatStatusTable(): bloco <pre> com tres colunas de 7."""
+    header = "%-7s|%7s|%7s|" % ("Período", "Mín".center(7), "Máx".center(7))
+    separator = "-------|-------|-------|"
+    rows = [
+        status_row("Hoje", data["has_today"], data["today_min"],
+                   data["today_max"]),
+        status_row("Ontem", data["has_yesterday"], data["yesterday_min"],
+                   data["yesterday_max"]),
+        status_row("7 dias", data["has_last7"], data["last7_min"],
+                   data["last7_max"]),
+        status_row("30 dias", data["has_last30"], data["last30_min"],
+                   data["last30_max"]),
+    ]
+    return "<pre>" + "\n".join([header, separator] + rows) + "</pre>"
 
 
 def build_status_message(data, version, uptime_s):
-    volume = format_liters(data["volume_l"]) if data["has_volume"] else "Sem dados"
-    return (
-        "Reservatório\n"
-        "Volume atual: %s\n"
-        "Hoje: %s\n"
-        "Ontem: %s\n"
-        "Últimos 7 dias: %s\n"
-        "Últimos 30 dias: %s\n"
-        "Firmware: %s\n"
-        "Uptime: %s"
-        % (
-            volume,
-            format_min_max(data["has_today"], data["today_min"], data["today_max"]),
-            format_min_max(data["has_yesterday"], data["yesterday_min"],
-                           data["yesterday_max"]),
-            format_min_max(data["has_last7"], data["last7_min"], data["last7_max"]),
-            format_min_max(data["has_last30"], data["last30_min"], data["last30_max"]),
-            version,
-            format_uptime(uptime_s),
-        )
-    )
+    """Espelho de buildStatusMessage(): nivel, litros, taxa recente e tabela."""
+    table = build_status_table(data)
+    rate_text = format_rate(data["rate_lph"], data["has_rate"])
+    if not data["has_level"]:
+        return ("Volume atual: sem leitura\n"
+                "\n"
+                "Taxa (1 h): %s\n"
+                "\n"
+                "%s\n"
+                "Firmware: %s\n"
+                "Uptime: %s" % (rate_text, table, version,
+                                format_uptime(uptime_s)))
+    return ("Volume atual: %s\n"
+            "\n"
+            "%s\n"
+            "\n"
+            "Taxa (1 h): %s\n"
+            "\n"
+            "%s\n"
+            "Firmware: %s\n"
+            "Uptime: %s"
+            % (alert_level_badge(data["level"]),
+               format_liters_keycap(data["volume_l"]), rate_text, table, version,
+               format_uptime(uptime_s)))
 
 
 HELP_MESSAGE = (
@@ -326,6 +379,8 @@ def contains_token_ignore_case(haystack, token):
 def full_status_data():
     return {
         "has_volume": True, "volume_l": 1234.0,
+        "has_level": True, "level": "NORMAL",
+        "has_rate": True, "rate_lph": -950.0,
         "has_today": True, "today_min": 1200.0, "today_max": 1310.0,
         "has_yesterday": True, "yesterday_min": 1150.0, "yesterday_max": 1290.0,
         "has_last7": True, "last7_min": 1100.0, "last7_max": 1320.0,
@@ -336,6 +391,8 @@ def full_status_data():
 def empty_status_data():
     return {
         "has_volume": False, "volume_l": 0.0,
+        "has_level": False, "level": "NORMAL",
+        "has_rate": False, "rate_lph": 0.0,
         "has_today": False, "today_min": 0.0, "today_max": 0.0,
         "has_yesterday": False, "yesterday_min": 0.0, "yesterday_max": 0.0,
         "has_last7": False, "last7_min": 0.0, "last7_max": 0.0,
@@ -694,12 +751,24 @@ def classify_boot_reason(ota_marker, reset_reason):
     return 8
 
 
-def build_boot_message(reason_code, version, level=None, liters=None):
-    message = "MoniRes reiniciado.\nVersão: %s\nMotivo: %s" % (
-        version, BOOT_REASON_TEXT[reason_code])
+LEVEL_BADGE = {
+    "NORMAL": "✅ <b>NORMAL</b>",
+    "RISK": "⚠️ <b>ATENÇÃO</b>",
+    "CRITICAL": "‼️ <b>CRÍTICO</b>",
+}
+
+
+def alert_level_badge(level):
+    return LEVEL_BADGE[level]
+
+
+def build_boot_message(reason_code, version, level=None, volume=None):
+    message = "Reiniciado.\nMotivo: %s\nVersão: %s" % (
+        BOOT_REASON_TEXT[reason_code], version)
     if level is None:
-        return message + "\nNível: sem leitura"
-    return message + "\nNível: %s - %s" % (level, liters)
+        return message + "\nVolume atual: sem leitura"
+    return message + "\nVolume atual: %s\n\n%s" % (
+        alert_level_badge(level), format_liters_keycap(volume))
 
 
 def test_boot_notice():
@@ -709,29 +778,40 @@ def test_boot_notice():
     text_header = strip_comments(read_text(TEXT_HEADER))
     telegram = strip_comments(read_text(TELEGRAM_CPP))
 
-    # 1) Mensagem: QUATRO linhas - a ultima da o estado do tanque AGORA, que da
-    # contexto ao reboot (o estado persistido pode ser de antes).
-    message = build_boot_message(1, "1.0.0", level="Normal", liters="102.047 L")
+    # 1) Mensagem: o estado do tanque AGORA (o persistido pode ser de antes do
+    # reboot) em MAIUSCULAS com emoji + negrito (parse_mode=HTML) e os litros do
+    # instante em digitos-emoji, na ultima linha.
+    message = build_boot_message(1, "1.0.0", level="NORMAL", volume=103587.0)
     lines = message.split("\n")
-    check(len(lines) == 4, "aviso tem exatamente 4 linhas (%d)" % len(lines))
-    check(lines[0] == "MoniRes reiniciado.", "1a linha: '<firmware> reiniciado.'")
-    check(lines[1] == "Versão: 1.0.0", "2a linha: versao do firmware")
-    check(lines[2] == "Motivo: Energização", "3a linha: motivo do boot")
-    check(lines[3] == "Nível: Normal - 102.047 L",
-          "4a linha: estado do tanque agora (com separador de milhar)")
+    check(len(lines) == 6, "aviso tem 6 linhas (branco antes dos litros) (%d)"
+          % len(lines))
+    check(lines[0] == "Reiniciado.", "1a linha: 'Reiniciado.'")
+    check(lines[1] == "Motivo: Energização", "2a linha: motivo do boot")
+    check(lines[2] == "Versão: 1.0.0", "3a linha: versao do firmware")
+    check(lines[3] == "Volume atual: ✅ <b>NORMAL</b>",
+          "4a linha: nivel agora (emoji + negrito)")
+    check(lines[4] == "", "5a linha: em branco (separa o nivel dos litros)")
+    check(lines[5] == keycap_liters("103.587"),
+          "6a linha: litros em digitos-emoji (separador de milhar)")
     no_reading = build_boot_message(1, "1.0.0").split("\n")
-    check(len(no_reading) == 4 and no_reading[3] == "Nível: sem leitura",
-          "sem amostra valida a 4a linha diz 'sem leitura'")
+    check(len(no_reading) == 4 and no_reading[3] == "Volume atual: sem leitura",
+          "sem amostra valida: 'sem leitura' e nenhum bloco de litros")
     check(len(message) < TG_MESSAGE_MAX, "cabe no buffer de mensagem (%d B)"
           % len(message))
-    check('TG_TEXT("MoniRes reiniciado.\\n"' in text_header,
+    check(alert_level_badge("RISK") == "⚠️ <b>ATENÇÃO</b>" and
+          alert_level_badge("CRITICAL") == "‼️ <b>CRÍTICO</b>",
+          "emblema dos outros dois niveis (emoji + negrito)")
+    check(format_liters_keycap(1.0) == "1\ufe0f\u20e3",
+          "keycap = digito + U+FE0F + U+20E3 (7 bytes por digito)")
+    check('TG_TEXT("Reiniciado.\\n"' in text_header,
           "texto do aviso vive em include/telegram_text.h")
-    check('"Versão: %s\\n"' in text_header and '"Motivo: %s\\n"' in text_header and
-          '"Nível: %s - %s"' in text_header and '"Nível: sem leitura"' in text_header,
-          "buildBootMessage usa versao, motivo e estado do nivel")
-    check("alertLevelName(level)" in text_header and
-          "formatLiters(volumeL, liters" in text_header,
-          "estado e volume vem das tabelas/formatadores do /w (uma fonte)")
+    check('"Motivo: %s\\n"' in text_header and '"Versão: %s\\n"' in text_header and
+          '"Volume atual: %s\\n\\n"' in text_header and
+          '"Volume atual: sem leitura"' in text_header,
+          "buildBootMessage usa motivo, versao, estado e o bloco de litros")
+    check("alertLevelBadge(level)" in text_header and
+          "formatLitersKeycap(volumeL, liters" in text_header,
+          "emblema e litros vem da camada de texto (uma fonte)")
     check("alerts::Level level, bool hasVolume, float volumeL" in text_header,
           "a camada pura recebe o nivel e o volume (nao recalcula nada)")
 
@@ -781,20 +861,31 @@ def test_boot_notice():
 
 
 def test_status():
-    print("\n6. Mensagem do /status (grupos e ordem)")
+    print("\n6. Mensagem do /status (nivel, litros, taxa e tabela)")
     message = build_status_message(full_status_data(), "1.0.0", 2 * 3600 + 15 * 60)
     lines = message.split("\n")
-    check(lines[0] == "Reservatório", "1o grupo: titulo")
-    check(lines[1] == "Volume atual: 1.234 L", "2o grupo: volume atual em litros")
-    check(lines[2] == "Hoje: min 1.200 L | max 1.310 L", "3o grupo: hoje (min/max)")
-    check(lines[3] == "Ontem: min 1.150 L | max 1.290 L", "4o grupo: ontem (min/max)")
-    check(lines[4] == "Últimos 7 dias: min 1.100 L | max 1.320 L",
-          "5o grupo: ultimos 7 dias completos")
-    check(lines[5] == "Últimos 30 dias: min 980 L | max 1.330 L",
-          "6o grupo: ultimos 30 dias completos")
-    check(lines[6] == "Firmware: 1.0.0", "7o grupo: versao do firmware")
-    check(lines[7] == "Uptime: 2h 15m", "8o grupo: uptime")
-    check(len(lines) == 8, "nenhuma linha extra")
+    check(lines[0] == "Volume atual: ✅ <b>NORMAL</b>",
+          "1a linha: nivel de AGORA (emoji + negrito)")
+    check(lines[1] == "", "2a linha: em branco")
+    check(lines[2] == keycap_liters("1.234"), "3a linha: litros em digitos-emoji")
+    check(lines[3] == "", "4a linha: em branco")
+    check(lines[4] == "Taxa (1 h): ↓ 950 L/h", "5a linha: taxa recente (1 h)")
+    check(lines[5] == "", "6a linha: em branco")
+    check(lines[6] == "<pre>Período|  Mín  |  Máx  |", "7a: cabecalho da tabela")
+    check(lines[7] == "-------|-------|-------|", "8a: separador da tabela")
+    check(lines[8] == "Hoje   |  1.200|  1.310|", "9a: hoje (min/max)")
+    check(lines[9] == "Ontem  |  1.150|  1.290|", "10a: ontem (min/max)")
+    check(lines[10] == "7 dias |  1.100|  1.320|", "11a: ultimos 7 dias")
+    check(lines[11] == "30 dias|    980|  1.330|</pre>", "12a: ultimos 30 dias")
+    check(lines[12] == "Firmware: 1.0.0", "13a: versao do firmware")
+    check(lines[13] == "Uptime: 2h 15m", "14a: uptime")
+    check(len(lines) == 14, "nenhuma linha extra")
+    check(message.count("<pre>") == 1 and message.count("</pre>") == 1,
+          "a tabela vai dentro de UM bloco <pre> (fonte fixa)")
+    for row in (lines[7], lines[8], lines[9], lines[10],
+                lines[11][:-len("</pre>")]):
+        check(len(row) == 24, "linha da tabela com 24 colunas (%d): %r"
+              % (len(row), row))
 
     for forbidden in ("Media", "media", "cobertura", "Wi-Fi", "WiFi", "MQTT",
                       "fila", "RSSI", "degradado"):
@@ -803,8 +894,16 @@ def test_status():
 
     print("\n7. Mensagem do /status sem dados")
     empty = build_status_message(empty_status_data(), "1.0.0", 30)
-    check(empty.count("Sem dados") == 5,
-          "volume, hoje, ontem, 7 dias e 30 dias mostram 'Sem dados'")
+    check("Sem dados" not in empty,
+          "o /status nao usa mais 'Sem dados' (a tabela mostra '-')")
+    check("Volume atual: sem leitura" in empty,
+          "sem amostra valida: 'sem leitura' (sem emblema nem litros)")
+    check(empty.count("\n\n") == 2,
+          "duas linhas em branco (sem os litros do volume)")
+    check("Taxa (1 h): sem base" in empty,
+          "sem base da taxa: a linha diz 'sem base'")
+    check("Hoje   |      -|      -|" in empty, "hoje sem dados mostra '-'")
+    check("30 dias|      -|      -|" in empty, "30 dias sem dados")
     check("Firmware: 1.0.0" in empty, "a versao aparece mesmo sem historico")
     check("Uptime: 0m" in empty, "o uptime aparece mesmo sem historico")
 
@@ -812,20 +911,29 @@ def test_status():
     partial_data = empty_status_data()
     partial_data["has_volume"] = True
     partial_data["volume_l"] = 830.4
+    partial_data["has_level"] = True
+    partial_data["level"] = "CRITICAL"
+    partial_data["has_rate"] = True
+    partial_data["rate_lph"] = -600.0
     partial_data["has_today"] = True
     partial_data["today_min"] = 800.6
     partial_data["today_max"] = 830.4
     partial = build_status_message(partial_data, "1.0.0", 90061)
-    check("Volume atual: 830 L" in partial, "volume arredondado para litros")
-    check("Hoje: min 801 L | max 830 L" in partial, "hoje com dados parciais")
-    check("Ontem: Sem dados" in partial, "ontem sem dados")
-    check("Últimos 7 dias: Sem dados" in partial, "7 dias sem dados")
-    check("Últimos 30 dias: Sem dados" in partial, "30 dias sem dados")
+    check("Volume atual: ‼️ <b>CRÍTICO</b>" in partial,
+          "nivel de AGORA do volume parcial (830 L esta no critico)")
+    check("Taxa (1 h): ↓ 600 L/h" in partial, "taxa recente no /status parcial")
+    check(keycap_liters("830") in partial, "volume em digitos-emoji")
+    check("Hoje   |    801|    830|" in partial, "hoje com dados parciais")
+    check("Ontem  |      -|      -|" in partial, "ontem sem dados")
+    check("7 dias |      -|      -|" in partial, "7 dias sem dados")
+    check("30 dias|      -|      -|" in partial, "30 dias sem dados")
     check("Uptime: 1d 1h 1m" in partial, "uptime em dias, horas e minutos")
 
     print("\n9. Tamanho e codificacao para o POST")
     big = {
         "has_volume": True, "volume_l": 99999.0,
+        "has_level": True, "level": "NORMAL",
+        "has_rate": True, "rate_lph": 2000.0,
         "has_today": True, "today_min": 99999.0, "today_max": 99999.0,
         "has_yesterday": True, "yesterday_min": 99999.0, "yesterday_max": 99999.0,
         "has_last7": True, "last7_min": 99999.0, "last7_max": 99999.0,
@@ -837,7 +945,7 @@ def test_status():
             ("valores grandes", big, 0)):
         text = build_status_message(data, CFG["FIRMWARE_VERSION"], uptime)
         encoded = url_encode(text)
-        body = "chat_id=-1001234567890&text=" + encoded
+        body = POST_PREFIX + encoded
         check(len(text) < TG_MESSAGE_MAX,
               "%s: mensagem (%d B) cabe em TG_MESSAGE_MAX" % (label, len(text)))
         check(len(body) < FORM_CAPACITY,
@@ -1209,13 +1317,24 @@ def test_invariants():
           "TG_TEXT mapeia os literais das mensagens para a flash (PSTR)")
     check(text_code.count("TG_TEXT(") >= 12,
           "todas as mensagens usam TG_TEXT() (%d ocorrencias)" % text_code.count("TG_TEXT("))
-    check('TG_TEXT("MoniRes reiniciado.' in text_code and
+    check('TG_TEXT("Reiniciado.' in text_code and
           'TG_TEXT("Comandos disponíveis:' in text_code and
-          'TG_TEXT("Reservatório\\n"' in text_code,
+          'TG_TEXT("Volume atual: %s\\n"' in text_code,
           "aviso de boot, /help e /status vem da flash")
-    check(text_code.count("Reservatório recuperou-se do nível") == 2 and
-          text_code.count("reservatório atingiu o nível") == 2,
-          "as quatro mensagens de alerta continuam identicas (dentro de TG_TEXT)")
+    check(text_code.count("***** ALERTA *****") == 2 and
+          text_code.count("***** RECUPERAÇÃO *****") == 2,
+          "as quatro mensagens de alerta continuam na camada de texto (TG_TEXT)")
+    check(text_code.count("<b>") == 3 and
+          'TG_TEXT("⚠️ <b>ATENÇÃO</b>")' in text_code and
+          'TG_TEXT("‼️ <b>CRÍTICO</b>")' in text_code and
+          'TG_TEXT("✅ <b>NORMAL</b>")' in text_code,
+          "o emblema do nivel usa emoji + negrito (parse_mode=HTML)")
+    check(text_code.count("formatLitersKeycap(") >= 3 and
+          "static_cast<char>(0xEF)" in text_code and
+          "static_cast<char>(0xA3)" in text_code,
+          "litros em digitos-emoji montados byte a byte (U+FE0F + U+20E3)")
+    check("formatRate(" in text_code and "RATE_STABLE_LPH" in text_code,
+          "a taxa recente vem da camada de texto (formatRate)")
     check('"/help"' in text_code and '"/status"' in text_code and
           '"/warnings"' in text_code,
           "os literais de comando continuam no header")
@@ -1365,18 +1484,18 @@ def alert_drain(level, cfg, volume, limit):
     return events, level
 
 
-def build_alert_message(event, volume):
-    liters = format_liters_bare(volume)
-    return {
-        "RISK_ENTERED":
-            "Alerta: reservatório atingiu o nível de risco - %s litros" % liters,
-        "CRITICAL_ENTERED":
-            "Alerta: reservatório atingiu o nível crítico - %s litros" % liters,
-        "CRITICAL_RECOVERED":
-            "Reservatório recuperou-se do nível crítico - %s litros" % liters,
-        "RISK_RECOVERED":
-            "Reservatório recuperou-se do nível de risco - %s litros" % liters,
-    }[event]
+def build_alert_message(event, volume, rate_lph=0.0, has_rate=False):
+    if event.endswith("ENTERED"):
+        header = "ALERTA"
+        level = "RISK" if event == "RISK_ENTERED" else "CRITICAL"
+    else:
+        header = "RECUPERAÇÃO"
+        level = "RISK" if event == "CRITICAL_RECOVERED" else "NORMAL"
+    tail = ""
+    if has_rate:
+        tail = "\n\nTaxa (1 h): %s" % format_rate(rate_lph, True)
+    return "***** %s *****\n\nVolume atual: %s\n\n%s%s" % (
+        header, alert_level_badge(level), format_liters_keycap(volume), tail)
 
 
 def parse_warnings(args):
@@ -1491,24 +1610,30 @@ def test_alerts():
           "rebaseline do /w adota o estado atual, sem evento")
 
     print("  19e. Texto exato das mensagens")
-    check(build_alert_message("RISK_ENTERED", 69990.0) ==
-          "Alerta: reservatório atingiu o nível de risco - 69.990 litros",
-          "alerta de risco")
-    check(build_alert_message("CRITICAL_ENTERED", 34995.0) ==
-          "Alerta: reservatório atingiu o nível crítico - 34.995 litros",
-          "alerta critico")
-    check(build_alert_message("CRITICAL_RECOVERED", 40828.0) ==
-          "Reservatório recuperou-se do nível crítico - 40.828 litros",
-          "recuperacao do critico")
-    check(build_alert_message("RISK_RECOVERED", 75823.0) ==
-          "Reservatório recuperou-se do nível de risco - 75.823 litros",
-          "recuperacao do risco")
-    check(build_alert_message("RISK_RECOVERED", 116651.0).endswith("116.651 litros"),
-          "separador de milhar no volume do alerta")
+    check(build_alert_message("RISK_ENTERED", 53129.0, -950.0, True) ==
+          "***** ALERTA *****\n\nVolume atual: ⚠️ <b>ATENÇÃO</b>\n\n" +
+          keycap_liters("53.129") + "\n\nTaxa (1 h): ↓ 950 L/h",
+          "alerta de atencao, com a taxa")
+    check(build_alert_message("CRITICAL_ENTERED", 23129.0, -1500.0, True) ==
+          "***** ALERTA *****\n\nVolume atual: ‼️ <b>CRÍTICO</b>\n\n" +
+          keycap_liters("23.129") + "\n\nTaxa (1 h): ↓ 1.500 L/h",
+          "alerta critico, com a taxa")
+    check(build_alert_message("CRITICAL_RECOVERED", 41129.0, 800.0, True) ==
+          "***** RECUPERAÇÃO *****\n\nVolume atual: ⚠️ <b>ATENÇÃO</b>\n\n" +
+          keycap_liters("41.129") + "\n\nTaxa (1 h): ↑ 800 L/h",
+          "recuperacao do critico, enchendo")
+    check(build_alert_message("RISK_RECOVERED", 113129.0) ==
+          "***** RECUPERAÇÃO *****\n\nVolume atual: ✅ <b>NORMAL</b>\n\n" +
+          keycap_liters("113.129"),
+          "sem base: a linha da taxa e OMITIDA")
+    check(build_alert_message("RISK_RECOVERED", 113129.0, 120.0, True).endswith(
+          "\n\nTaxa (1 h): → estável"), "dentro da banda: 'estável'")
+    check(format_liters_keycap(116651.0) == keycap_liters("116.651"),
+          "litros do alerta em digitos-emoji (separador de milhar)")
     for event in ("RISK_ENTERED", "CRITICAL_ENTERED", "CRITICAL_RECOVERED",
                   "RISK_RECOVERED"):
-        message = build_alert_message(event, 69990.0)
-        body = "chat_id=-1001234567890&text=" + url_encode(message)
+        message = build_alert_message(event, 53129.0, -12345.0, True)
+        body = POST_PREFIX + url_encode(message)
         check(len(message) < TG_MESSAGE_MAX and len(body) < FORM_CAPACITY,
               "%s cabe na mensagem (%d B) e no POST (%d B)"
               % (event, len(message), len(body)))
@@ -1533,23 +1658,28 @@ def test_alerts():
     check("alerts::levelFor" in monitor, "rebaseline silencioso ao aplicar /w")
     check("buildAlertMessage" in monitor and "alerts::popPending" in monitor,
           "peek/confirm pelo modulo de alertas")
-    check("void Telegram::flushPendingAlerts(uint32_t nowMs, AlertMonitor *alerts)"
-          in telegram, "Telegram entrega os alertas pendentes")
+    check("void Telegram::flushPendingAlerts(uint32_t nowMs,"
+          in telegram and "const TelegramContext &context)" in telegram,
+          "Telegram entrega os alertas pendentes")
+    check("alerts->peekPending(context.rateLph, context.hasRate" in telegram,
+          "a taxa recente entra na mensagem do alerta")
     check("alerts->confirmPending();" in telegram,
           "confirmado so depois do envio bem-sucedido")
-    flush_at = telegram.find("flushPendingAlerts(nowMs, context.alerts);")
+    flush_at = telegram.find("flushPendingAlerts(nowMs, context);")
     poll_at = telegram.find("pollOnce(nowMs, context);")
     check(flush_at != -1 and poll_at != -1 and flush_at < poll_at,
           "alerta sai ANTES da consulta (mesma sessao TLS)")
     check("TgCommand::Warnings" in telegram, "answerCommand trata o /w")
     check("parseWarnings(tgArgsOf(g_normalized), requested)" in telegram,
           "argumentos vem do texto normalizado (puro)")
-    check(text_header.count("Reservatório recuperou-se do nível") == 2 and
-          text_header.count("reservatório atingiu o nível") == 2,
+    check(text_header.count("***** ALERTA *****") == 2 and
+          text_header.count("***** RECUPERAÇÃO *****") == 2,
           "as quatro mensagens vivem na camada de texto")
+    check('"chat_id=%lld&parse_mode=HTML&text="' in telegram,
+          "sendMessage envia parse_mode=HTML (emoji + negrito do novo padrao)")
     check("Limites atualizados." in text_header and "Uso: /w lr lc hist" in text_header,
           "confirmacao e erro do /w com o uso")
-    check("o crítico deve ser menor que o risco" in text_header,
+    check("o crítico deve ser menor que a atenção" in text_header,
           "erro de ordem explicado ao operador")
 
 

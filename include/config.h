@@ -105,7 +105,7 @@ enum class SimScenario : uint8_t {
 constexpr SimScenario SIM_SCENARIO = SimScenario::CYCLE;
 
 constexpr bool  SIM_NOISE     = true;   // ruido artificial nas amostras ADC
-constexpr float SIM_TIME_SCALE = 1.0f; // 1x: rampas de 120 s reais
+constexpr float SIM_TIME_SCALE = 0.10f; // 0.1x: rampas de 1200 s
 
 constexpr uint32_t SIM_SCENARIO_DURATION_MS = 120000; // rampas/recuperacao
 constexpr float    SIM_NOISE_AMPLITUDE_COUNTS = 3.0f; // +/- 3 contagens ADC
@@ -126,11 +126,11 @@ constexpr float SIM_RECOVERY_END_MM        = 2200.0f;
 
 // CYCLE: esvazia de SIM_DRAINING_START_MM ate SIM_DRAINING_END_MM em
 // SIM_CYCLE_DRAIN_MS, enche de volta em SIM_CYCLE_FILL_MS e recomeca, para
-// sempre. Com os limites de fabrica (risco 60%, critico 30%, histerese 5%)
-// um ciclo de 240 s percorre, nesta ordem: atingiu o risco (~41 s), atingiu o
-// critico (~84 s), recuperou-se do critico (~163 s) e recuperou-se do risco
+// sempre. Com os limites de fabrica (atenção 60%, critico 30%, histerese 5%)
+// um ciclo de 240 s percorre, nesta ordem: atingiu a atenção (~41 s), atingiu o
+// critico (~84 s), recuperou-se do critico (~163 s) e recuperou-se da atenção
 // (~206 s) - os quatro avisos, mais as histereses de um lado so. O
-// OSCILLATING, em contraste, oscila em volta de 1500 mm e so cruza o risco.
+// OSCILLATING, em contraste, oscila em volta de 1500 mm e so cruza a atenção.
 constexpr uint32_t SIM_CYCLE_DRAIN_MS = 120000UL;
 constexpr uint32_t SIM_CYCLE_FILL_MS  = 120000UL;
 
@@ -500,10 +500,10 @@ static_assert(TELEGRAM_SESSION_MAX_AGE_MS < 3600000UL,
 //
 //  O firmware compara o volume FILTRADO (o mesmo do display, do MQTT e do
 //  /status) com dois limiares e envia UMA mensagem por transicao:
-//    volume <= lr                  -> "atingiu o nivel de risco"
+//    volume <= lr                  -> "atingiu o nivel de atenção"
 //    volume <= lc                  -> "atingiu o nivel critico"
 //    subiu para >= lc + hist       -> "recuperou-se do nivel critico"
-//    subiu para >= lr + hist       -> "recuperou-se do nivel de risco"
+//    subiu para >= lr + hist       -> "recuperou-se do nivel de atenção"
 //
 //  Os limiares sao PERCENTUAIS DO MAIOR VOLUME MEDIVEL (fundo de escala do
 //  sensor): 100% = volume::maxMeasurableLiters() = 116.651 L (nivel corrigido de
@@ -532,9 +532,9 @@ static_assert(volume::maxMeasurableLiters() > 116000.0f &&
                   volume::maxMeasurableLiters() < 117000.0f,
               "a referencia dos alertas deve ser o teto do sensor (116.651 L)");
 static_assert(ALERT_DEFAULT_CRITICAL_PCT < ALERT_DEFAULT_RISK_PCT,
-              "o limiar critico deve ser menor que o de risco");
+              "o limiar critico deve ser menor que o de atenção");
 static_assert(ALERT_DEFAULT_RISK_PCT + ALERT_DEFAULT_HIST_PCT <= 100,
-              "risco + histerese nao pode passar de 100% (nunca recuperaria)");
+              "atenção + histerese nao pode passar de 100% (nunca recuperaria)");
 static_assert(ALERT_SETTLE_MS >= MOVING_AVERAGE_WINDOW * SAMPLE_INTERVAL_MS,
               "o settle deve cobrir o filtro cheio (janela x intervalo)");
 // ---------------------------------------------------------------------------
