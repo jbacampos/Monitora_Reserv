@@ -153,8 +153,8 @@ VOL = read_float_constants(
 
 # Constante da taxa recente (include/rate.h, header PURO): a banda em que o
 # indicador diz "estável" - abaixo dela o que existe e o piso do ADC.
-RATE_STABLE_LPH = read_float_constants(
-    RATE_HEADER, ["RATE_STABLE_LPH"])["RATE_STABLE_LPH"]
+RATE_STABLE_LPM = read_float_constants(
+    RATE_HEADER, ["RATE_STABLE_LPM"])["RATE_STABLE_LPM"]
 
 
 def mirrors_calibration():
@@ -181,8 +181,9 @@ _m = re.search(r"char g_form\[([0-9]+)\];", _tg_cpp)
 FORM_CAPACITY = int(_m.group(1)) if _m else 640
 
 # Prefixo do corpo do POST, espelho de sendMessage(): o parse_mode=HTML viaja
-# junto com o chat_id (o texto codificado vem logo depois).
-POST_PREFIX = "chat_id=-1001234567890&parse_mode=HTML&text="
+# junto com o chat_id (o texto codificado vem logo depois). O id usa o MAIOR
+# comprimento realista (17 digitos = "-100" + 13) para o teste virar um teto.
+POST_PREFIX = "chat_id=-1001234567890123&parse_mode=HTML&text="
 
 
 # ---------------------------------------------------------------------------
@@ -271,16 +272,15 @@ def format_liters_keycap(liters):
     return keycap_liters(format_liters_bare(liters))
 
 
-def format_rate(liters_per_hour, has_rate):
-    """Espelho de formatRate(): seta + L/h, 'estável' ou 'sem base'."""
+def format_rate(liters_per_minute, has_rate):
+    """Espelho de formatRate(): seta + L/min, 'estável' ou 'sem base'."""
     if not has_rate:
         return "sem base"
-    if -RATE_STABLE_LPH < liters_per_hour < RATE_STABLE_LPH:
+    if -RATE_STABLE_LPM < liters_per_minute < RATE_STABLE_LPM:
         return "→ estável"
-    magnitude = abs(liters_per_hour)
-    rounded = int(magnitude / 10.0 + 0.5) * 10
-    arrow = "↑" if liters_per_hour > 0 else "↓"
-    return "%s %s L/h" % (arrow, format_grouped(rounded))
+    rounded = int(abs(liters_per_minute) + 0.5)
+    arrow = "↑" if liters_per_minute > 0 else "↓"
+    return "%s %s L/min" % (arrow, format_grouped(rounded))
 
 
 def status_row(label, has_data, minimum, maximum):
@@ -292,13 +292,13 @@ def status_row(label, has_data, minimum, maximum):
                               else int(maximum - 0.5))
     else:
         low = high = "-"
-    return "%-7s|%7s|%7s|" % (label, low, high)
+    return "%-7s|%7s |%7s |" % (label, low, high)
 
 
 def build_status_table(data):
-    """Espelho de formatStatusTable(): bloco <pre> com tres colunas de 7."""
-    header = "%-7s|%7s|%7s|" % ("Período", "Mín".center(7), "Máx".center(7))
-    separator = "-------|-------|-------|"
+    """Espelho de formatStatusTable(): bloco <pre>, valores com espaco a direita."""
+    header = "%-7s|%7s |%7s |" % ("Período", "Mín".center(7), "Máx".center(7))
+    separator = "-------|--------|--------|"
     rows = [
         status_row("Hoje", data["has_today"], data["today_min"],
                    data["today_max"]),
@@ -315,11 +315,11 @@ def build_status_table(data):
 def build_status_message(data, version, uptime_s):
     """Espelho de buildStatusMessage(): nivel, litros, taxa recente e tabela."""
     table = build_status_table(data)
-    rate_text = format_rate(data["rate_lph"], data["has_rate"])
+    rate_text = format_rate(data["rate_lpm"], data["has_rate"])
     if not data["has_level"]:
         return ("Volume atual: sem leitura\n"
                 "\n"
-                "Taxa (1 h): %s\n"
+                "Tendência (5 min): %s\n"
                 "\n"
                 "%s\n"
                 "Firmware: %s\n"
@@ -329,7 +329,7 @@ def build_status_message(data, version, uptime_s):
             "\n"
             "%s\n"
             "\n"
-            "Taxa (1 h): %s\n"
+            "Tendência (5 min): %s\n"
             "\n"
             "%s\n"
             "Firmware: %s\n"
@@ -343,15 +343,32 @@ HELP_MESSAGE = (
     "Comandos disponíveis:\n"
     "/help ou /h - lista de comandos disponíveis\n"
     "/status ou /s - situação atual do reservatório\n"
-    "/warnings ou /w - limites e alertas de nível"
+    "/warnings ou /w - limites e alertas de nível\n"
+    "  /w [a] [c] [m] - aplica limites percentuais de atenção, crítico e margem de retorno\n"
+    "    [a] = atenção (1 a 100)\n"
+    "    [c] = crítico (1 a 100)\n"
+    "    [m] = margem de retorno (1 a 100)\n"
+    "    ex.: /w 30 20 5"
 )
 
 
+# Caracteres seguros no urlEncodeInto(): alfanumericos ASCII + "-_.~". Tudo o
+# mais vira %XX (a acentuacao custa 2 bytes = 6 B por letra).
+SAFE_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~")
+
+
 def url_encode(text):
-    """Espelho de urlEncodeInto(): mesmos caracteres seguros do firmware."""
+    """Espelho de urlEncodeInto(): mesmos caracteres seguros do firmware.
+
+    O isalnum() do core roda na locale "C" (SO ASCII): uma letra acentuada NAO
+    e segura e vira %XX por byte UTF-8. Usar str.isalnum() do Python (Unicode)
+    subestimava o corpo do POST e deixava passar mensagem que nao cabia em
+    g_form (defeito de 2026-11-22: o /help novo estourava e era descartado).
+    """
     out = []
     for char in text:
-        if char.isalnum() or char in "-_.~":
+        if char in SAFE_CHARS:
             out.append(char)
         else:
             for byte in char.encode("utf-8"):
@@ -380,7 +397,7 @@ def full_status_data():
     return {
         "has_volume": True, "volume_l": 1234.0,
         "has_level": True, "level": "NORMAL",
-        "has_rate": True, "rate_lph": -950.0,
+        "has_rate": True, "rate_lpm": -40.0,
         "has_today": True, "today_min": 1200.0, "today_max": 1310.0,
         "has_yesterday": True, "yesterday_min": 1150.0, "yesterday_max": 1290.0,
         "has_last7": True, "last7_min": 1100.0, "last7_max": 1320.0,
@@ -392,7 +409,7 @@ def empty_status_data():
     return {
         "has_volume": False, "volume_l": 0.0,
         "has_level": False, "level": "NORMAL",
-        "has_rate": False, "rate_lph": 0.0,
+        "has_rate": False, "rate_lpm": 0.0,
         "has_today": False, "today_min": 0.0, "today_max": 0.0,
         "has_yesterday": False, "yesterday_min": 0.0, "yesterday_max": 0.0,
         "has_last7": False, "last7_min": 0.0, "last7_max": 0.0,
@@ -686,6 +703,60 @@ def test_uptime():
     check(line == "Uptime: 2h 0m", "2 h depois da virada: %s" % line)
 
 
+def cpp_message_string(function_name):
+    """Concatena os literais TG_TEXT("...") de uma funcao de telegram_text.h.
+
+    Serve para comparar o texto REAL do firmware com o espelho Python e flagrar
+    divergencia (o espelho e escrito a mao).
+    """
+    with open(TEXT_HEADER, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    body = re.search(r"inline void " + function_name + r"\b.*?\n}\n", text,
+                     re.S).group(0)
+    return "".join(
+        re.findall(r'"((?:[^"\\]|\\.)*)"', body)).replace("\\n", "\n")
+
+
+# Tags aceitas pelo parse_mode=HTML nesta aplicacao. Qualquer outro "<...>" faz
+# a API responder 400 ("can't parse entities: Unsupported start tag") e a
+# mensagem INTEIRA e recusada - foi o defeito de 2026-11-22, quando o /help
+# passou a listar os argumentos como "<a> <c> <m>".
+ALLOWED_HTML_TAGS = ("<pre>", "</pre>", "<b>", "</b>")
+
+
+def tg_text_messages():
+    """Cada mensagem TG_TEXT("...") de telegram_text.h, como texto final."""
+    with open(TEXT_HEADER, "r", encoding="utf-8") as handle:
+        source = handle.read()
+    messages = []
+    for call in re.findall(r'TG_TEXT\(\s*((?:\s*"(?:[^"\\]|\\.)*")+)\s*\)',
+                           source):
+        messages.append("".join(re.findall(r'"((?:[^"\\]|\\.)*)"', call)))
+    return messages
+
+
+def unsupported_html(text):
+    """'<'/'>' que NAO fazem parte de uma tag permitida do Telegram."""
+    stripped = text
+    for tag in ALLOWED_HTML_TAGS:
+        stripped = stripped.replace(tag, "")
+    return [char for char in "<>" if char in stripped]
+
+
+def test_html_tags():
+    print("\n5c. Tags HTML das mensagens (parse_mode=HTML recusa tag desconhecida)")
+    offenders = []
+    for message in tg_text_messages():
+        bad = unsupported_html(message)
+        if bad:
+            offenders.append("%r -> %s" % (message, bad))
+    check(not offenders,
+          "so <pre>/<b> nas mensagens (%s)"
+          % ("; ".join(offenders) if offenders else "nenhuma tag extra"))
+    check(unsupported_html(HELP_MESSAGE) == [],
+          "o /help nao usa '<>' (o Telegram recusaria com HTTP 400)")
+
+
 def test_help():
     print("\n5. Mensagem do /help")
     check(HELP_MESSAGE.splitlines()[0] == "Comandos disponíveis:",
@@ -700,6 +771,16 @@ def test_help():
     check("/warnings ou /w" in HELP_MESSAGE.splitlines()[3],
           "o /w e anunciado com a abreviacao")
     check(len(HELP_MESSAGE) < TG_MESSAGE_MAX, "cabe no buffer de mensagem")
+    # O texto do FIRMWARE tem de ser identico a este espelho (sem divergencia)...
+    firmware_help = cpp_message_string("buildHelpMessage")
+    check(firmware_help == HELP_MESSAGE,
+          "o /help do firmware e identico a este espelho")
+    # ... e CABER no corpo do POST. Antes de 2026-11-22 este teste mentia: o
+    # url_encode() usava str.isalnum() (Unicode) e nao contava o custo dos
+    # acentos, deixando passar uma mensagem que o device descartava.
+    help_post = POST_PREFIX + url_encode(HELP_MESSAGE)
+    check(len(help_post) < FORM_CAPACITY,
+          "o /help cabe no POST (%d de %d B)" % (len(help_post), FORM_CAPACITY))
 
 
 BOOT_REASON_TEXT = {
@@ -869,14 +950,14 @@ def test_status():
     check(lines[1] == "", "2a linha: em branco")
     check(lines[2] == keycap_liters("1.234"), "3a linha: litros em digitos-emoji")
     check(lines[3] == "", "4a linha: em branco")
-    check(lines[4] == "Taxa (1 h): ↓ 950 L/h", "5a linha: taxa recente (1 h)")
+    check(lines[4] == "Tendência (5 min): ↓ 40 L/min", "5a linha: tendencia recente (5 min)")
     check(lines[5] == "", "6a linha: em branco")
-    check(lines[6] == "<pre>Período|  Mín  |  Máx  |", "7a: cabecalho da tabela")
-    check(lines[7] == "-------|-------|-------|", "8a: separador da tabela")
-    check(lines[8] == "Hoje   |  1.200|  1.310|", "9a: hoje (min/max)")
-    check(lines[9] == "Ontem  |  1.150|  1.290|", "10a: ontem (min/max)")
-    check(lines[10] == "7 dias |  1.100|  1.320|", "11a: ultimos 7 dias")
-    check(lines[11] == "30 dias|    980|  1.330|</pre>", "12a: ultimos 30 dias")
+    check(lines[6] == "<pre>Período|  Mín   |  Máx   |", "7a: cabecalho da tabela")
+    check(lines[7] == "-------|--------|--------|", "8a: separador da tabela")
+    check(lines[8] == "Hoje   |  1.200 |  1.310 |", "9a: hoje (min/max)")
+    check(lines[9] == "Ontem  |  1.150 |  1.290 |", "10a: ontem (min/max)")
+    check(lines[10] == "7 dias |  1.100 |  1.320 |", "11a: ultimos 7 dias")
+    check(lines[11] == "30 dias|    980 |  1.330 |</pre>", "12a: ultimos 30 dias")
     check(lines[12] == "Firmware: 1.0.0", "13a: versao do firmware")
     check(lines[13] == "Uptime: 2h 15m", "14a: uptime")
     check(len(lines) == 14, "nenhuma linha extra")
@@ -884,7 +965,7 @@ def test_status():
           "a tabela vai dentro de UM bloco <pre> (fonte fixa)")
     for row in (lines[7], lines[8], lines[9], lines[10],
                 lines[11][:-len("</pre>")]):
-        check(len(row) == 24, "linha da tabela com 24 colunas (%d): %r"
+        check(len(row) == 26, "linha da tabela com 26 colunas (%d): %r"
               % (len(row), row))
 
     for forbidden in ("Media", "media", "cobertura", "Wi-Fi", "WiFi", "MQTT",
@@ -900,10 +981,10 @@ def test_status():
           "sem amostra valida: 'sem leitura' (sem emblema nem litros)")
     check(empty.count("\n\n") == 2,
           "duas linhas em branco (sem os litros do volume)")
-    check("Taxa (1 h): sem base" in empty,
-          "sem base da taxa: a linha diz 'sem base'")
-    check("Hoje   |      -|      -|" in empty, "hoje sem dados mostra '-'")
-    check("30 dias|      -|      -|" in empty, "30 dias sem dados")
+    check("Tendência (5 min): sem base" in empty,
+          "sem base da tendencia: a linha diz 'sem base'")
+    check("Hoje   |      - |      - |" in empty, "hoje sem dados mostra '-'")
+    check("30 dias|      - |      - |" in empty, "30 dias sem dados")
     check("Firmware: 1.0.0" in empty, "a versao aparece mesmo sem historico")
     check("Uptime: 0m" in empty, "o uptime aparece mesmo sem historico")
 
@@ -914,35 +995,46 @@ def test_status():
     partial_data["has_level"] = True
     partial_data["level"] = "CRITICAL"
     partial_data["has_rate"] = True
-    partial_data["rate_lph"] = -600.0
+    partial_data["rate_lpm"] = -35.0
     partial_data["has_today"] = True
     partial_data["today_min"] = 800.6
     partial_data["today_max"] = 830.4
     partial = build_status_message(partial_data, "1.0.0", 90061)
     check("Volume atual: ‼️ <b>CRÍTICO</b>" in partial,
           "nivel de AGORA do volume parcial (830 L esta no critico)")
-    check("Taxa (1 h): ↓ 600 L/h" in partial, "taxa recente no /status parcial")
+    check("Tendência (5 min): ↓ 35 L/min" in partial, "tendencia recente no /status parcial")
     check(keycap_liters("830") in partial, "volume em digitos-emoji")
-    check("Hoje   |    801|    830|" in partial, "hoje com dados parciais")
-    check("Ontem  |      -|      -|" in partial, "ontem sem dados")
-    check("7 dias |      -|      -|" in partial, "7 dias sem dados")
-    check("30 dias|      -|      -|" in partial, "30 dias sem dados")
+    check("Hoje   |    801 |    830 |" in partial, "hoje com dados parciais")
+    check("Ontem  |      - |      - |" in partial, "ontem sem dados")
+    check("7 dias |      - |      - |" in partial, "7 dias sem dados")
+    check("30 dias|      - |      - |" in partial, "30 dias sem dados")
     check("Uptime: 1d 1h 1m" in partial, "uptime em dias, horas e minutos")
 
     print("\n9. Tamanho e codificacao para o POST")
     big = {
         "has_volume": True, "volume_l": 99999.0,
         "has_level": True, "level": "NORMAL",
-        "has_rate": True, "rate_lph": 2000.0,
+        "has_rate": True, "rate_lpm": 2000.0,
         "has_today": True, "today_min": 99999.0, "today_max": 99999.0,
         "has_yesterday": True, "yesterday_min": 99999.0, "yesterday_max": 99999.0,
         "has_last7": True, "last7_min": 99999.0, "last7_max": 99999.0,
         "has_last30": True, "last30_min": 99999.0, "last30_max": 99999.0,
     }
+    # Teto do sensor (116.651 L): o maior volume possivel em cada celula - e o
+    # pior caso REAL do /status (ja ficou a 3 B do limite com g_form de 640 B).
+    ceiling = dict(big)
+    ceiling.update({
+        "volume_l": MAX_LITERS,
+        "today_min": MAX_LITERS, "today_max": MAX_LITERS,
+        "yesterday_min": MAX_LITERS, "yesterday_max": MAX_LITERS,
+        "last7_min": MAX_LITERS, "last7_max": MAX_LITERS,
+        "last30_min": MAX_LITERS, "last30_max": MAX_LITERS,
+    })
     for label, data, uptime in (
             ("completo", full_status_data(), 3 * 86400 + 7 * 3600 + 42 * 60),
             ("vazio", empty_status_data(), 0),
-            ("valores grandes", big, 0)):
+            ("valores grandes", big, 0),
+            ("teto 116.651", ceiling, 9 * 86400 + 23 * 3600 + 59 * 60)):
         text = build_status_message(data, CFG["FIRMWARE_VERSION"], uptime)
         encoded = url_encode(text)
         body = POST_PREFIX + encoded
@@ -1333,13 +1425,17 @@ def test_invariants():
           "static_cast<char>(0xEF)" in text_code and
           "static_cast<char>(0xA3)" in text_code,
           "litros em digitos-emoji montados byte a byte (U+FE0F + U+20E3)")
-    check("formatRate(" in text_code and "RATE_STABLE_LPH" in text_code,
+    check("formatRate(" in text_code and "RATE_STABLE_LPM" in text_code,
           "a taxa recente vem da camada de texto (formatRate)")
     check('"/help"' in text_code and '"/status"' in text_code and
           '"/warnings"' in text_code,
           "os literais de comando continuam no header")
     check("PSTR(" in telegram and "PSTR(" in monitor_cpp and "PSTR(" in main_cpp,
           "os formatos de log dos tres arquivos tambem vao para a flash")
+    # Um 400 do sendMessage nao dizia o motivo; a API explica no corpo.
+    check("sendMessage recusado" in telegram and
+          r'\"description\":\"' in telegram,
+          "o log do 400 mostra a recusa da API (ex.: can't parse entities)")
 
     check(CFG["TELEGRAM_FIRST_POLL_DELAY_MS"] == 1000 and
           CFG["TELEGRAM_FIRST_POLL_DELAY_MS"] < CFG["TELEGRAM_POLL_INTERVAL_MS"],
@@ -1484,7 +1580,7 @@ def alert_drain(level, cfg, volume, limit):
     return events, level
 
 
-def build_alert_message(event, volume, rate_lph=0.0, has_rate=False):
+def build_alert_message(event, volume, rate_lpm=0.0, has_rate=False):
     if event.endswith("ENTERED"):
         header = "ALERTA"
         level = "RISK" if event == "RISK_ENTERED" else "CRITICAL"
@@ -1493,7 +1589,7 @@ def build_alert_message(event, volume, rate_lph=0.0, has_rate=False):
         level = "RISK" if event == "CRITICAL_RECOVERED" else "NORMAL"
     tail = ""
     if has_rate:
-        tail = "\n\nTaxa (1 h): %s" % format_rate(rate_lph, True)
+        tail = "\n\nTendência (5 min): %s" % format_rate(rate_lpm, True)
     return "***** %s *****\n\nVolume atual: %s\n\n%s%s" % (
         header, alert_level_badge(level), format_liters_keycap(volume), tail)
 
@@ -1610,24 +1706,24 @@ def test_alerts():
           "rebaseline do /w adota o estado atual, sem evento")
 
     print("  19e. Texto exato das mensagens")
-    check(build_alert_message("RISK_ENTERED", 53129.0, -950.0, True) ==
+    check(build_alert_message("RISK_ENTERED", 53129.0, -40.0, True) ==
           "***** ALERTA *****\n\nVolume atual: ⚠️ <b>ATENÇÃO</b>\n\n" +
-          keycap_liters("53.129") + "\n\nTaxa (1 h): ↓ 950 L/h",
+          keycap_liters("53.129") + "\n\nTendência (5 min): ↓ 40 L/min",
           "alerta de atencao, com a taxa")
-    check(build_alert_message("CRITICAL_ENTERED", 23129.0, -1500.0, True) ==
+    check(build_alert_message("CRITICAL_ENTERED", 23129.0, -60.0, True) ==
           "***** ALERTA *****\n\nVolume atual: ‼️ <b>CRÍTICO</b>\n\n" +
-          keycap_liters("23.129") + "\n\nTaxa (1 h): ↓ 1.500 L/h",
+          keycap_liters("23.129") + "\n\nTendência (5 min): ↓ 60 L/min",
           "alerta critico, com a taxa")
-    check(build_alert_message("CRITICAL_RECOVERED", 41129.0, 800.0, True) ==
+    check(build_alert_message("CRITICAL_RECOVERED", 41129.0, 35.0, True) ==
           "***** RECUPERAÇÃO *****\n\nVolume atual: ⚠️ <b>ATENÇÃO</b>\n\n" +
-          keycap_liters("41.129") + "\n\nTaxa (1 h): ↑ 800 L/h",
+          keycap_liters("41.129") + "\n\nTendência (5 min): ↑ 35 L/min",
           "recuperacao do critico, enchendo")
     check(build_alert_message("RISK_RECOVERED", 113129.0) ==
           "***** RECUPERAÇÃO *****\n\nVolume atual: ✅ <b>NORMAL</b>\n\n" +
           keycap_liters("113.129"),
           "sem base: a linha da taxa e OMITIDA")
-    check(build_alert_message("RISK_RECOVERED", 113129.0, 120.0, True).endswith(
-          "\n\nTaxa (1 h): → estável"), "dentro da banda: 'estável'")
+    check(build_alert_message("RISK_RECOVERED", 113129.0, 12.0, True).endswith(
+          "\n\nTendência (5 min): → estável"), "dentro da banda: 'estável'")
     check(format_liters_keycap(116651.0) == keycap_liters("116.651"),
           "litros do alerta em digitos-emoji (separador de milhar)")
     for event in ("RISK_ENTERED", "CRITICAL_ENTERED", "CRITICAL_RECOVERED",
@@ -1661,7 +1757,7 @@ def test_alerts():
     check("void Telegram::flushPendingAlerts(uint32_t nowMs,"
           in telegram and "const TelegramContext &context)" in telegram,
           "Telegram entrega os alertas pendentes")
-    check("alerts->peekPending(context.rateLph, context.hasRate" in telegram,
+    check("alerts->peekPending(context.rateLpm, context.hasRate" in telegram,
           "a taxa recente entra na mensagem do alerta")
     check("alerts->confirmPending();" in telegram,
           "confirmado so depois do envio bem-sucedido")
@@ -1690,6 +1786,7 @@ def main():
     test_uptime()
     test_help()
     test_boot_notice()
+    test_html_tags()
     test_status()
     test_http_helpers()
     test_alerts()

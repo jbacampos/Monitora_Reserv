@@ -124,7 +124,7 @@ void printDiagnostics(uint32_t nowMs) {
   // Taxa recente: MESMO formato das mensagens (uma unica fonte de texto). E por
   // este log que se decide se RATE_WINDOW_MS esta adequado a producao.
   char rateText[24];
-  formatRate(rate::litersPerHour(g_rate), rate::hasRate(g_rate), rateText,
+  formatRate(rate::litersPerMinute(g_rate), rate::hasRate(g_rate), rateText,
              sizeof(rateText));
   Serial.printf(PSTR(" | taxa=%s"), rateText);
 
@@ -275,7 +275,7 @@ void loop() {
   telegramContext.volumeL = g_filteredLiters;
   telegramContext.uptimeS = g_uptime.seconds();
   telegramContext.sampleValid = g_hasSample;
-  telegramContext.rateLph = rate::litersPerHour(g_rate);
+  telegramContext.rateLpm = rate::litersPerMinute(g_rate);
   telegramContext.hasRate = rate::hasRate(g_rate);
   telegramContext.history = &g_history;
   telegramContext.alerts = &g_alerts;

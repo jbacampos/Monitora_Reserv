@@ -7,7 +7,7 @@
 //
 //  Mantem uma serie CURTA em RAM com a media movel JA publicada
 //  (g_filteredLiters - a mesma do display, do MQTT, do /status e dos alertas) e
-//  devolve a inclinacao em litros por hora. Nada e persistido: a serie e perdida
+//  devolve a inclinacao em litros por MINUTO. Nada e persistido: a serie e perdida
 //  no reboot e o indicador volta a "sem base" ate a janela encher. As constantes
 //  de tempo e de limiar ficam logo abaixo (RATE_*).
 // ============================================================================
@@ -22,22 +22,21 @@ namespace rate {
 //  proprio header.
 //
 //  Dimensionamento (manda a resolucao do sensor): 1 contagem do ADC equivale a
-//  2,93 mm = 116 L, portanto a taxa so e significativa se a variacao na janela
-//  passar de ~2 contagens (~230 L):
+//  2,93 mm = 116 L. A janela de 5 min enxerga pouco volume, entao a AMOSTRAGEM
+//  desce para 1 min (5 pontos): a 5 min por ponto o anel teria UM ponto so.
 //
-//      janela >= 230 L / taxa esperada
-//
-//  Em 1 h: 2.000 L/h = 17 contagens (excelente), 500 L/h = 4,3 (bom),
-//  250 L/h = 2,2 (limitrofe: 2 h ficaria melhor), 100 L/h = 0,9 (ruido: so com
-//  ~3 h). Ajustar RATE_WINDOW_MS depois de olhar a taxa no log de producao.
+//  Em 5 min: 2.000 L/h = 167 L (~1,4 contagem, excelente); 500 L/h = 42 L
+//  (~0,4: no piso do ADC). Por isso a banda "estável" acompanha a janela:
+//  30 L/min = 151 L em 5 min ~= 1,3 contagem - o mesmo criterio dos 150 L/h da
+//  janela de 1 h. Ajustar depois de olhar a taxa no log de producao.
 // ---------------------------------------------------------------------------
-constexpr uint32_t RATE_SAMPLE_INTERVAL_MS = 300000UL;  // 5 min (mesmo tick do snapshot)
-constexpr uint32_t RATE_WINDOW_MS          = 3600000UL; // 1 h
+constexpr uint32_t RATE_SAMPLE_INTERVAL_MS = 60000UL;   // 1 min (5 pontos na janela)
+constexpr uint32_t RATE_WINDOW_MS          = 300000UL;  // 5 min
 constexpr uint8_t  RATE_SLOTS =
     static_cast<uint8_t>(RATE_WINDOW_MS / RATE_SAMPLE_INTERVAL_MS);
-constexpr float    RATE_STABLE_LPH  = 150.0f;    // ~1,3 contagem/h: piso do ADC
-constexpr uint8_t  RATE_MIN_SAMPLES = 7;         // base pronta em ~30 min
-constexpr uint32_t RATE_MIN_SPAN_MS = 1800000UL; // 30 min
+constexpr float    RATE_STABLE_LPM  = 30.0f;      // ~1,3 contagem (116 L) em 5 min
+constexpr uint8_t  RATE_MIN_SAMPLES = 3;          // base pronta em ~2 min
+constexpr uint32_t RATE_MIN_SPAN_MS = 120000UL;   // 2 min
 
 static_assert(RATE_WINDOW_MS % RATE_SAMPLE_INTERVAL_MS == 0,
               "a janela deve ser multipla do intervalo de amostragem");
@@ -48,7 +47,7 @@ static_assert(RATE_MIN_SPAN_MS == (RATE_MIN_SAMPLES - 1) * RATE_SAMPLE_INTERVAL_
 static_assert(RATE_MIN_SAMPLES <= RATE_SLOTS,
               "o minimo de pontos nao pode passar do anel");
 static_assert(RATE_MIN_SAMPLES >= 3, "minimos quadrados exigem ao menos 3 pontos");
-static_assert(RATE_STABLE_LPH > 0.0f, "a banda estavel deve ser positiva");
+static_assert(RATE_STABLE_LPM > 0.0f, "a banda estavel deve ser positiva");
 
 struct Ring {
   float liters[RATE_SLOTS] = {};
@@ -59,7 +58,7 @@ struct Ring {
 };
 
 // Zera a serie. O ultimo push fica UM intervalo atras, de forma que a primeira
-// amostra valida ja entra no anel (e nao so 5 min depois do boot). A conta
+// amostra valida ja entra no anel (e nao so 1 min depois do boot). A conta
 // funciona no rollover de millis() porque tudo aqui e aritmetica de uint32_t.
 inline void begin(Ring &r, uint32_t nowMs) {
   r = Ring();
@@ -84,11 +83,11 @@ inline bool hasRate(const Ring &r) {
   return static_cast<uint32_t>(newest - oldest) >= RATE_MIN_SPAN_MS;
 }
 
-// Inclinacao em litros por hora, por MINIMOS QUADRADOS (um ponto ruim nao
-// estraga a hora inteira, como aconteceria so com primeiro/ultimo). `x` entra em
+// Inclinacao em litros por MINUTO, por MINIMOS QUADRADOS (um ponto ruim nao
+// estraga a janela inteira, como aconteceria so com primeiro/ultimo). `x` entra em
 // segundos relativos ao ponto mais antigo: a diferenca de uint32_t ja e o delta,
 // portanto o rollover de millis() nao afeta o resultado. Devolve 0 sem base.
-inline float litersPerHour(const Ring &r) {
+inline float litersPerMinute(const Ring &r) {
   if (!hasRate(r)) {
     return 0.0f;
   }
@@ -114,7 +113,7 @@ inline float litersPerHour(const Ring &r) {
   if (den <= 0.0f) {
     return 0.0f;  // todos os pontos no mesmo instante
   }
-  return ((n * sxy - sx * sy) / den) * 3600.0f;
+  return ((n * sxy - sx * sy) / den) * 60.0f;
 }
 
 // Chamado a cada iteracao do loop: guarda um ponto a cada

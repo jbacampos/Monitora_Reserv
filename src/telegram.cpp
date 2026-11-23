@@ -59,7 +59,12 @@ uint32_t sessionAgeMs(uint32_t nowMs) {
 // Buffers fixos do protocolo, usados apenas durante uma consulta. Ficam em
 // .bss (nao no heap) para nao fragmentar a memoria nem arriscar a pilha.
 char g_body[TELEGRAM_BODY_MAX];   // corpo da resposta HTTP (lido e parseado)
-char g_form[640];                 // corpo do POST: chat_id + text codificado
+// Corpo do POST: prefixo (chat_id + parse_mode, ate ~47 B com id de 17 digitos)
+// mais o texto codificado. urlEncodeInto() gasta 3 B por byte NAO seguro e o
+// isalnum() do core e ASCII-only: acento (2 bytes) vira 6 B e espaco 3 B. Os
+// 768 B cobrem o pior caso medido (/help = 696 B); re-medir se uma mensagem
+// ganhar linhas - o verificador host_test confere isso.
+char g_form[768];
 char g_message[TG_MESSAGE_MAX];   // texto da resposta (/help ou /status)
 char g_request[256];              // linha de requisicao + cabecalhos
 char g_line[128];                 // uma linha de cabecalho por vez
@@ -696,7 +701,7 @@ void buildStatusData(const TelegramContext &context, TelegramStatusData &data) {
   data.hasVolume = context.sampleValid;
   data.volumeL = context.volumeL;
   data.hasRate = context.hasRate;
-  data.rateLph = context.rateLph;
+  data.rateLpm = context.rateLpm;
   if (context.sampleValid && context.alerts != nullptr) {
     data.hasLevel = true;
     data.level = context.alerts->levelForVolume(context.volumeL);
@@ -1093,7 +1098,7 @@ void Telegram::flushPendingAlerts(uint32_t nowMs,
                                   const TelegramContext &context) {
   AlertMonitor *alerts = context.alerts;
   if (alerts == nullptr ||
-      !alerts->peekPending(context.rateLph, context.hasRate, g_message,
+      !alerts->peekPending(context.rateLpm, context.hasRate, g_message,
                            sizeof(g_message))) {
     return;
   }
@@ -1454,6 +1459,23 @@ bool Telegram::sendMessage(int64_t chatId, const char *text) {
   }
   if (status != 200) {
     Serial.printf("TG: sendMessage HTTP %d\n", status);
+    // A API explica a recusa no corpo (ex.: "can't parse entities: Unsupported
+    // start tag" quando o texto tem um "<...>" que o parse_mode=HTML nao
+    // conhece). Sem isso, um 400 fica sem causa no log de campo.
+    const char *description = strstr(g_body, "\"description\":\"");
+    if (description != nullptr) {
+      description += 15;  // strlen("\"description\":\"")
+      const char *end = strchr(description, '"');
+      size_t length = end != nullptr ? static_cast<size_t>(end - description)
+                                     : strlen(description);
+      if (length > 95) {
+        length = 95;
+      }
+      char reason[96];
+      memcpy(reason, description, length);
+      reason[length] = '\0';
+      Serial.printf("TG: sendMessage recusado: %s\n", reason);
+    }
     return false;
   }
 

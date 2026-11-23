@@ -45,10 +45,10 @@ struct TelegramContext {
   // millis() e nao e hora civil.
   uint32_t uptimeS = 0;
   bool sampleValid = false;
-  // Taxa de variacao recente (include/rate.h), em litros por hora, derivada da
+  // Taxa de variacao recente (include/rate.h), em litros por minuto, derivada da
   // MESMA media movel do volume. `hasRate` e falso enquanto a janela nao tem
   // base (ou depois de um reboot, quando a serie em RAM comeca do zero).
-  float rateLph = 0.0f;
+  float rateLpm = 0.0f;
   bool hasRate = false;
   // Fonte dos agregados do /status. Nao ha segunda fonte de historico.
   const History *history = nullptr;

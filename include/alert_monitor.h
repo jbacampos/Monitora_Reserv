@@ -53,7 +53,7 @@ class AlertMonitor {
   // Proxima mensagem a enviar (a mais antiga). false = nada pendente. A taxa
   // recente (include/rate.h) entra na mensagem quando o chamador a tem; sem base
   // (ou sem leitura) a linha da taxa simplesmente nao aparece.
-  bool peekPending(float rateLph, bool hasRate, char *out, size_t cap) const;
+  bool peekPending(float rateLpm, bool hasRate, char *out, size_t cap) const;
   // Confirma o envio da mensagem devolvida por peekPending() e persiste.
   void confirmPending();
 

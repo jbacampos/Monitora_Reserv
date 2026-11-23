@@ -278,12 +278,12 @@ alerts::ConfigError AlertMonitor::applyConfig(const alerts::Config &cfg,
   return alerts::ConfigError::OK;
 }
 
-bool AlertMonitor::peekPending(float rateLph, bool hasRate, char *out,
+bool AlertMonitor::peekPending(float rateLpm, bool hasRate, char *out,
                                size_t cap) const {
   if (out == nullptr || cap == 0 || m_state.pendingCount == 0) {
     return false;
   }
-  buildAlertMessage(m_state.pendingEvent[0], m_state.pendingVolumeL[0], rateLph,
+  buildAlertMessage(m_state.pendingEvent[0], m_state.pendingVolumeL[0], rateLpm,
                     hasRate, out, cap);
   return out[0] != '\0';
 }

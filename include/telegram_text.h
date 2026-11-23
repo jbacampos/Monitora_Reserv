@@ -312,29 +312,29 @@ inline void formatLitersKeycap(float liters, char *out, size_t outSize) {
   out[written] = '\0';
 }
 
-// Taxa recente ("↑ 1.950 L/h", "↓ 950 L/h", "→ estável" ou "sem base"). O valor
-// e arredondado a 10 L/h e o sinal vira seta: a mensagem nunca mostra "-". Dentro
-// da banda estavel o que existe e a quantizacao do ADC (1 contagem = 116 L), nao
-// movimento do tanque.
-inline void formatRate(float litersPerHour, bool hasRate, char *out,
+// Taxa recente ("↑ 33 L/min", "↓ 16 L/min", "→ estável" ou "sem base"). O valor
+// e arredondado a 1 L/min e o sinal vira seta: a mensagem nunca mostra "-".
+// Dentro da banda estavel o que existe e a quantizacao do ADC (1 contagem =
+// 116 L) na janela, nao movimento do tanque.
+inline void formatRate(float litersPerMinute, bool hasRate, char *out,
                        size_t outSize) {
   if (!hasRate) {
     snprintf(out, outSize, TG_TEXT("sem base"));
     return;
   }
-  if (litersPerHour > -rate::RATE_STABLE_LPH &&
-      litersPerHour < rate::RATE_STABLE_LPH) {
+  if (litersPerMinute > -rate::RATE_STABLE_LPM &&
+      litersPerMinute < rate::RATE_STABLE_LPM) {
     snprintf(out, outSize, TG_TEXT("→ estável"));
     return;
   }
 
   const float magnitude =
-      (litersPerHour < 0.0f) ? -litersPerHour : litersPerHour;
-  const long rounded = static_cast<long>(magnitude / 10.0f + 0.5f) * 10L;
+      (litersPerMinute < 0.0f) ? -litersPerMinute : litersPerMinute;
+  const long rounded = static_cast<long>(magnitude + 0.5f);
   char grouped[16];
   formatGroupedLong(rounded, grouped, sizeof(grouped));
-  snprintf(out, outSize, TG_TEXT("%s %s L/h"),
-           (litersPerHour > 0.0f) ? TG_TEXT("↑") : TG_TEXT("↓"), grouped);
+  snprintf(out, outSize, TG_TEXT("%s %s L/min"),
+           (litersPerMinute > 0.0f) ? TG_TEXT("↑") : TG_TEXT("↓"), grouped);
 }
 
 // Nome do estado do nivel ("Normal", "Atenção", "Crítico"). Usado pelo aviso de
@@ -379,7 +379,7 @@ struct TelegramStatusData {
   alerts::Level level = alerts::Level::NORMAL;
   // Taxa recente (include/rate.h), ja calculada pelo chamador.
   bool hasRate = false;
-  float rateLph = 0.0f;
+  float rateLpm = 0.0f;
 
   bool hasToday = false;
   float todayMinL = 0.0f;
@@ -399,9 +399,11 @@ struct TelegramStatusData {
 };
 
 // Uma linha da tabela: rotulo a esquerda, valores a direita. Periodo sem dados
-// mostra "-" (mantem as QUATRO linhas e o alinhamento). Colunas de 7: cabem
-// "Período"/"30 dias" e o maior volume possivel (116.651), com o POST ainda
-// folgado (medido: 538 de 640 B no pior caso - o espaco custa 3 B no encoding).
+// mostra "-" (mantem as QUATRO linhas e o alinhamento). O rotulo fica a
+// esquerda (nao muda); cada VALOR leva um ESPACO a direita, logo antes do "|",
+// para nao encostar na barra. Colunas de 7: "Período"/"30 dias" e o maior
+// volume (116.651) cabem, com o POST ainda folgado no pior caso (medido: 617
+// de 640 B - cada espaco custa 3 B no encoding).
 inline void formatStatusRow(const char *label, bool hasData, float minL,
                             float maxL, char *out, size_t outSize) {
   char low[12];
@@ -416,7 +418,7 @@ inline void formatStatusRow(const char *label, bool hasData, float minL,
     snprintf(high, sizeof(high), TG_TEXT("-"));
   }
 
-  snprintf(out, outSize, TG_TEXT("%-7s|%7s|%7s|"), label, low, high);
+  snprintf(out, outSize, TG_TEXT("%-7s|%7s |%7s |"), label, low, high);
 }
 
 // Bloco <pre> do /status. So dentro de <pre> o Telegram usa a fonte FIXA e
@@ -437,8 +439,8 @@ inline void formatStatusTable(const TelegramStatusData &data, char *out,
                   data.last30MaxL, last30, sizeof(last30));
 
   snprintf(out, outSize,
-           TG_TEXT("<pre>%-7s|%7s|%7s|\n"
-                   "-------|-------|-------|\n"
+           TG_TEXT("<pre>%-7s|%7s |%7s |\n"
+                   "-------|--------|--------|\n"
                    "%s\n%s\n%s\n%s</pre>"),
            TG_TEXT("Período"), TG_TEXT("  Mín  "), TG_TEXT("  Máx  "), today,
            yesterday, last7, last30);
@@ -457,13 +459,13 @@ inline void buildStatusMessage(const TelegramStatusData &data,
   formatStatusTable(data, table, sizeof(table));
 
   char rateText[24];
-  formatRate(data.rateLph, data.hasRate, rateText, sizeof(rateText));
+  formatRate(data.rateLpm, data.hasRate, rateText, sizeof(rateText));
 
   if (!data.hasLevel) {
     snprintf(out, outSize,
              TG_TEXT("Volume atual: sem leitura\n"
                      "\n"
-                     "Taxa (1 h): %s\n"
+                     "Tendência (5 min): %s\n"
                      "\n"
                      "%s\n"
                      "Firmware: %s\n"
@@ -479,7 +481,7 @@ inline void buildStatusMessage(const TelegramStatusData &data,
                    "\n"
                    "%s\n"
                    "\n"
-                   "Taxa (1 h): %s\n"
+                   "Tendência (5 min): %s\n"
                    "\n"
                    "%s\n"
                    "Firmware: %s\n"
@@ -494,7 +496,12 @@ inline void buildHelpMessage(char *out, size_t outSize) {
            TG_TEXT("Comandos disponíveis:\n"
                    "/help ou /h - lista de comandos disponíveis\n"
                    "/status ou /s - situação atual do reservatório\n"
-                   "/warnings ou /w - limites e alertas de nível"));
+                   "/warnings ou /w - limites e alertas de nível\n"
+                   "  /w [a] [c] [m] - aplica limites percentuais de atenção, crítico e margem de retorno\n"
+                   "    [a] = atenção (1 a 100)\n"
+                   "    [c] = crítico (1 a 100)\n"
+                   "    [m] = margem de retorno (1 a 100)\n"
+                   "    ex.: /w 30 20 5"));
 }
 
 // ---------------------------------------------------------------------------
@@ -590,7 +597,7 @@ inline void buildWarningsLimits(alerts::Config cfg, alerts::Level level,
   snprintf(out, outSize,
            TG_TEXT("Atenção: %u%% = %s L\n"
                    "Crítico: %u%% = %s L\n"
-                   "Histerese: %u pontos\n"
+                   "Margem retorno  : %u pontos\n"
                    "Estado atual: %s"),
            static_cast<unsigned>(cfg.riskPct), risk,
            static_cast<unsigned>(cfg.criticalPct), critical,
@@ -643,7 +650,7 @@ inline void buildWarningsErrorMessage(const char *reason, alerts::Config cfg,
 // As quatro mensagens: ALERTA ao piorar o nível, RECUPERAÇÃO ao melhorar, sempre
 // com o cabeçalho padrao, o nível resultante (emoji + nome em negrito), os litros
 // do instante da transicao em digitos-emoji e - quando ha base - a taxa recente.
-inline void buildAlertMessage(alerts::Event event, float volumeL, float rateLph,
+inline void buildAlertMessage(alerts::Event event, float volumeL, float rateLpm,
                               bool hasRate, char *out, size_t outSize) {
   char liters[48];
   formatLitersKeycap(volumeL, liters, sizeof(liters));
@@ -653,8 +660,8 @@ inline void buildAlertMessage(alerts::Event event, float volumeL, float rateLph,
   tail[0] = '\0';
   if (hasRate) {
     char rateText[24];
-    formatRate(rateLph, true, rateText, sizeof(rateText));
-    snprintf(tail, sizeof(tail), TG_TEXT("\n\nTaxa (1 h): %s"), rateText);
+    formatRate(rateLpm, true, rateText, sizeof(rateText));
+    snprintf(tail, sizeof(tail), TG_TEXT("\n\nTendência (5 min): %s"), rateText);
   }
 
   switch (event) {
